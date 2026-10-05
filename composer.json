@@ -1,0 +1,66 @@
+{
+  "name": "fixwire/fixwire",
+  "description": "Fixwire SDK for PHP: errors, traces, cron monitors and feedback",
+  "type": "library",
+  "license": "MIT",
+  "keywords": [
+    "fixwire",
+    "errors",
+    "monitoring",
+    "tracing",
+    "opentelemetry"
+  ],
+  "homepage": "https://fixwire.io",
+  "require": {
+    "php": ">=8.1",
+    "ext-json": "*",
+    "ext-mbstring": "*"
+  },
+  "require-dev": {
+    "friendsofphp/php-cs-fixer": "^3.64",
+    "guzzlehttp/guzzle": "^7.9",
+    "monolog/monolog": "^3.7",
+    "phpstan/phpstan": "^2.1",
+    "psr/http-server-middleware": "^1.0",
+    "phpunit/phpunit": "^10.5 || ^11.5 || ^12.0"
+  },
+  "suggest": {
+    "ext-curl": "Sends with curl (else PHP streams)",
+    "ext-zlib": "Compresses what is sent",
+    "monolog/monolog": "Log records as breadcrumbs and events (Fixwire\\Monolog\\Handler)",
+    "guzzlehttp/guzzle": "Outgoing requests as client spans (Fixwire\\Guzzle\\Middleware)",
+    "psr/http-server-middleware": "Requests in PSR-15 apps such as Slim (Fixwire\\Psr15\\Middleware)"
+  },
+  "autoload": {
+    "psr-4": {
+      "Fixwire\\": "src/"
+    },
+    "files": [
+      "src/functions.php"
+    ]
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "Fixwire\\Tests\\": "tests/"
+    }
+  },
+  "scripts": {
+    "test": "phpunit",
+    "analyse": "phpstan analyse",
+    "format": [
+      "@putenv PHP_CS_FIXER_IGNORE_ENV=1",
+      "php-cs-fixer fix"
+    ],
+    "check-format": [
+      "@putenv PHP_CS_FIXER_IGNORE_ENV=1",
+      "php-cs-fixer fix --dry-run --diff"
+    ]
+  },
+  "config": {
+    "sort-packages": true
+  },
+  "support": {
+    "issues": "https://github.com/fixwire/fixwire-php/issues",
+    "source": "https://github.com/fixwire/fixwire-php"
+  }
+}
