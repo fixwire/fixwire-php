@@ -72,6 +72,26 @@ final class Hub
         }
     }
 
+    /**
+     * @internal for integrations whose work starts and ends in separate callbacks (queue jobs):
+     * a copy of the current scope, current until popScope()
+     */
+    public function pushScope(): Scope
+    {
+        $scope = clone $this->getScope();
+        $this->scopes[] = $scope;
+
+        return $scope;
+    }
+
+    /** @internal ends the scope pushScope() made; the outermost scope stays */
+    public function popScope(): void
+    {
+        if (\count($this->scopes) > 1) {
+            array_pop($this->scopes);
+        }
+    }
+
     /** The current span, or null. */
     public function getSpan(): ?Span
     {

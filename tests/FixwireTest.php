@@ -20,6 +20,7 @@ use Fixwire\Options;
 use Fixwire\Scope;
 use Fixwire\Sessions;
 use Fixwire\Span;
+use Fixwire\SpanKind;
 use Fixwire\User;
 use PHPUnit\Framework\TestCase;
 
@@ -241,6 +242,31 @@ final class FixwireTest extends TestCase
         self::assertSame('POST /checkout', FakeIngest::kv($rec['attributes'])['fixwire.transaction']);
     }
 
+    public function testDatesSpansTimedElsewhereAndNestsScopes(): void
+    {
+        $ingest = new FakeIngest();
+        $hub = $ingest->hub(['traces_sample_rate' => 1.0]);
+        $root = $hub->startSpan('nightly', 'task');
+        // A query that ran already, dated back (as framework integrations do).
+        Span::start($hub, 'SELECT 1', 'db.query', [], SpanKind::Client, current: false, startTime: 1791200000.5)->finish(1791200000.75);
+        self::assertSame($root, $hub->getSpan(), 'not made current');
+        $root->finish();
+
+        $job = $hub->pushScope();
+        $job->setTag('job', 'export');
+        $hub->captureMessage('in the job');
+        $hub->popScope();
+        $hub->popScope(); // the outermost scope stays
+        $hub->captureMessage('after it');
+        $hub->flush();
+
+        $query = array_column(FakeIngest::spans($ingest->requests('/v1/traces')), null, 'name')['SELECT 1'];
+        self::assertSame(['1791200000500000000', '1791200000750000000'], [$query['startTimeUnixNano'], $query['endTimeUnixNano']]);
+        self::assertSame($root->spanId, $query['parentSpanId']);
+        $tags = array_map(static fn(array $r): mixed => FakeIngest::kv($r['attributes'])['fixwire.tags'] ?? null, FakeIngest::logRecords($ingest->requests('/v1/logs')));
+        self::assertSame([['job' => 'export'], null], $tags);
+    }
+
     public function testContinuesCallersTraces(): void
     {
         $ingest = new FakeIngest();
@@ -302,6 +328,29 @@ final class FixwireTest extends TestCase
         self::assertCount(2, array_unique(array_column($body['aggregates'], 'did')));
         self::assertContains(Sessions::deviceId(new User('user-0')), array_column($body['aggregates'], 'did'));
         self::assertSame(32, \strlen((string) Sessions::deviceId(new User('user-0'))));
+    }
+
+    public function testAsksForTheUserWhenItIsNeeded(): void
+    {
+        $ingest = new FakeIngest();
+        $hub = $ingest->hub(['release' => 'shop@1.0.0', 'auto_session_tracking' => true]);
+        $signedIn = null;
+        $hub->getScope()->userProvider = static function () use (&$signedIn): ?User {
+            return $signedIn === null ? null : new User($signedIn);
+        };
+        $end = $hub->startRequestSession();
+        $hub->captureMessage('before signing in');
+        $signedIn = 'user-9';
+        $hub->captureMessage('after');
+        $hub->getScope()->setUser(new User('user-1'));
+        $hub->captureMessage('set explicitly');
+        $hub->getScope()->setUser(null);
+        $end();
+        $hub->flush();
+
+        $users = array_map(static fn(array $r): mixed => FakeIngest::kv($r['attributes'])['user.id'] ?? null, FakeIngest::logRecords($ingest->requests('/v1/logs')));
+        self::assertSame([null, 'user-9', 'user-1'], $users);
+        self::assertSame(Sessions::deviceId(new User('user-9')), $ingest->requests('/v1/sessions')[0]['body']['aggregates'][0]['did']);
     }
 
     public function testSendsCheckInsAtOnceAndFeedbackLater(): void

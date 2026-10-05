@@ -64,9 +64,10 @@ final class Span
         ?string $traceparent,
         ?string $tracestate,
         ?string $baggage,
+        ?float $startTime,
     ) {
         $this->spanId = Ids::new(8);
-        $this->start = microtime(true);
+        $this->start = $startTime ?? microtime(true);
         $continued = $traceparent === null ? null : self::parseTraceparent($traceparent);
         if ($continued !== null) {
             [$this->traceId, $this->parentSpanId, $this->sampled] = $continued;
@@ -97,10 +98,11 @@ final class Span
      * @internal use \Fixwire\startSpan() or Hub::startSpan()
      *
      * @param array<string, mixed> $attributes
+     * @param float|null           $startTime  when it started, in Unix seconds (now when null)
      */
-    public static function start(Hub $hub, string $name, ?string $op, array $attributes, ?SpanKind $kind, ?string $traceparent = null, ?string $tracestate = null, ?string $baggage = null, bool $current = true): self
+    public static function start(Hub $hub, string $name, ?string $op, array $attributes, ?SpanKind $kind, ?string $traceparent = null, ?string $tracestate = null, ?string $baggage = null, bool $current = true, ?float $startTime = null): self
     {
-        $span = new self($hub, $name, $op, $attributes, $kind, $traceparent === null ? $hub->getSpan() : null, $traceparent, $tracestate, $baggage);
+        $span = new self($hub, $name, $op, $attributes, $kind, $traceparent === null ? $hub->getSpan() : null, $traceparent, $tracestate, $baggage, $startTime);
         if ($current) {
             $hub->setSpan($span);
         } else {
@@ -201,13 +203,15 @@ final class Span
     /**
      * Ends the span and makes the span before it current again. A segment is sent with the spans
      * finished under it; a span finishing after its segment was sent goes alone.
+     *
+     * @param float|null $endTime when it ended, in Unix seconds (now when null), for work timed elsewhere
      */
-    public function finish(): void
+    public function finish(?float $endTime = null): void
     {
         if ($this->end !== null) {
             return;
         }
-        $this->end = microtime(true);
+        $this->end = $endTime ?? microtime(true);
         if ($this->hub->getSpan() === $this) {
             $this->hub->setSpan($this->previous);
         }

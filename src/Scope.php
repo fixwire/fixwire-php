@@ -36,6 +36,14 @@ final class Scope
     /** @internal the request's session, for release health */
     public ?RequestSession $session = null;
 
+    /**
+     * @internal for integrations: the user when none was set, read when it is needed (frameworks
+     * know the signed-in user only once their authentication ran)
+     *
+     * @var (\Closure(): ?User)|null
+     */
+    public ?\Closure $userProvider = null;
+
     public function setUser(?User $user): self
     {
         $this->user = $user === null ? null : clone $user;
@@ -45,7 +53,17 @@ final class Scope
 
     public function getUser(): ?User
     {
-        return $this->user === null ? null : clone $this->user;
+        if ($this->user !== null) {
+            return clone $this->user;
+        }
+        if ($this->userProvider === null) {
+            return null;
+        }
+        try {
+            return ($this->userProvider)();
+        } catch (\Throwable) {
+            return null;
+        }
     }
 
     /** Sets a searchable tag; null removes it. */
@@ -158,6 +176,7 @@ final class Scope
         $this->tags = $this->contexts = $this->extra = $this->breadcrumbs = $this->fingerprint = [];
         $this->level = $this->transaction = $this->request = null;
         $this->session = null;
+        $this->userProvider = null;
 
         return $this;
     }
@@ -165,7 +184,7 @@ final class Scope
     /** @internal adds what the scope knows to an event; the event's own details win */
     public function applyTo(Event $e, ?Span $span): void
     {
-        $e->user ??= $this->user === null ? null : clone $this->user;
+        $e->user ??= $this->getUser();
         $e->tags += $this->tags;
         $e->contexts += $this->contexts;
         $e->extra += $this->extra;
