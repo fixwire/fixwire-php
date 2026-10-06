@@ -1,3 +1,6 @@
+# Text files have LF line endings on every system, Windows checkouts included.
+* text=auto eol=lf
+
 # Left out of the package Composer installs.
 /.gitattributes export-ignore
 /.github export-ignore
