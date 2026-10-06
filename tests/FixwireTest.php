@@ -73,12 +73,13 @@ final class FixwireTest extends TestCase
     {
         $_SERVER['FIXWIRE_RELEASE'] = 'shop@2.0.0';
         $_ENV['FIXWIRE_ENVIRONMENT'] = 'staging';
+        $_SERVER['FIXWIRE_DEBUG'] = 'true';
         try {
             $o = Options::fromArray([]);
             $o->applyDefaults();
-            self::assertSame(['shop@2.0.0', 'staging', 'shop'], [$o->release, $o->environment, $o->serviceName]);
+            self::assertSame(['shop@2.0.0', 'staging', 'shop', true], [$o->release, $o->environment, $o->serviceName, $o->debug]);
         } finally {
-            unset($_SERVER['FIXWIRE_RELEASE'], $_ENV['FIXWIRE_ENVIRONMENT']);
+            unset($_SERVER['FIXWIRE_RELEASE'], $_ENV['FIXWIRE_ENVIRONMENT'], $_SERVER['FIXWIRE_DEBUG']);
         }
     }
 

@@ -77,7 +77,7 @@ final class Options
     /** The timeout of a request to Fixwire, in seconds (default 2: it runs at the end of a request). */
     public float $timeout = 2.0;
 
-    /** Log what the SDK does to stderr. */
+    /** Log what the SDK does, and what it drops, to PHP's error log; FIXWIRE_DEBUG=1 turns it on too. */
     public bool $debug = false;
 
     /**
@@ -130,6 +130,7 @@ final class Options
         $this->dsn = self::orEnv($this->dsn, 'FIXWIRE_DSN');
         $this->release = self::orEnv($this->release, 'FIXWIRE_RELEASE');
         $this->environment = self::orEnv($this->environment, 'FIXWIRE_ENVIRONMENT') ?? 'production';
+        $this->debug = $this->debug || \in_array(strtolower((string) self::orEnv(null, 'FIXWIRE_DEBUG')), ['1', 'true', 'yes', 'on'], true);
         $this->serverName = self::empty($this->serverName) ? (gethostname() ?: null) : $this->serverName;
         $this->serviceName = self::orEnv($this->serviceName, 'OTEL_SERVICE_NAME');
         if (self::empty($this->serviceName) && $this->release !== null && strpos($this->release, '@') > 0) {
