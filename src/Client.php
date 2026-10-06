@@ -16,7 +16,7 @@ use Fixwire\Transport\Transport;
 final class Client
 {
     public const SDK_NAME = 'fixwire.php';
-    public const SDK_VERSION = '0.1.0';
+    public const SDK_VERSION = '0.1.1';
 
     // The kinds of data, as the protocol's rate limits name them.
     private const ERROR = 'error';

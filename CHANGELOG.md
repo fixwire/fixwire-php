@@ -4,7 +4,7 @@ All notable changes to the Fixwire PHP SDK are listed here. Versions follow [Sem
 Versioning](https://semver.org); before 1.0, a minor version may change the
 API.
 
-## [Unreleased]
+## [0.1.1] - 2026-10-06
 
 - Under PHP-FPM and LiteSpeed, what was captured is sent after the response has ended: last of the shutdown functions, the SDK writes the session and calls `fastcgi_finish_request()` (`litespeed_finish_request()`), so the client no longer waits for Fixwire. `finish_request` (new, on) turns it off.
 - When Fixwire doesn't answer, nothing is sent to it for 10 s, then twice as long after each try that gets no answer either (up to 5 minutes), until it answers.
