@@ -15,6 +15,9 @@ final class Budget
     private const MAX_ISSUES = 1024;
     private const TOP_FRAMES = 5;
 
+    /** The bytes of a message its issue is told by: enough, and they keep VARIABLE (quadratic on some text) fast. */
+    private const MESSAGE_BYTES = 1024;
+
     /** Parts of a message that change between occurrences. */
     private const VARIABLE = '/\b0x[0-9a-fA-F]+\b|\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b|'
         . '\b[0-9a-fA-F]{16,}\b|[0-9]+(?:\.[0-9]+)?|\S+@\S+\.\w+/';
@@ -54,7 +57,8 @@ final class Budget
         $b = $this->issues[$issue] ?? ['tokens' => (float) $this->burst, 'updated' => $now, 'suppressed' => 0];
         unset($this->issues[$issue]); // re-added last: recently seen
         if (\count($this->issues) >= self::MAX_ISSUES) {
-            array_shift($this->issues);
+            // Not array_shift: it is O(n) and renumbers the hashes PHP made integer keys.
+            unset($this->issues[array_key_first($this->issues)]);
         }
         $ok = self::take($b, $this->burst, $this->perIssuePerMinute, $now) && self::take($this->all, $this->perMinute, $this->perMinute, $now);
         if ($ok) {
@@ -117,15 +121,23 @@ final class Budget
                 $parts[] = $f->module . '|' . $f->function;
             }
             if ($frames === []) {
-                $parts[] = (string) preg_replace(self::VARIABLE, '<*>', $e->exceptions[0]->message);
+                $parts[] = self::invariant($e->exceptions[0]->message);
             }
         } else {
-            $parts[] = (string) preg_replace(self::VARIABLE, '<*>', (string) $e->message);
+            $parts[] = self::invariant((string) $e->message);
         }
         if ($e->fingerprint !== []) {
             $parts[] = implode("\x1f", $e->fingerprint);
         }
 
         return hash('fnv1a64', implode("\x1e", $parts));
+    }
+
+    /** The start of a message without the parts that vary (as it is, should PCRE give up). */
+    private static function invariant(string $message): string
+    {
+        $message = substr($message, 0, self::MESSAGE_BYTES);
+
+        return preg_replace(self::VARIABLE, '<*>', $message) ?? $message;
     }
 }

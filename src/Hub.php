@@ -178,8 +178,8 @@ final class Hub
                 } catch (\Throwable) {
                     // keep the breadcrumb as it was
                 }
-                if ($breadcrumb === null) {
-                    return;
+                if (!$breadcrumb instanceof Breadcrumb) {
+                    return; // dropped (null), or not one: never a TypeError into the app's code
                 }
             }
         }

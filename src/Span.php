@@ -18,6 +18,9 @@ final class Span
     /** The spans a segment keeps until it is sent. */
     public const MAX_CHILDREN = 1000;
 
+    /** The longest tracestate or baggage passed on, in bytes: W3C's limit for baggage. */
+    private const MAX_HEADER = 8192;
+
     public readonly string $traceId;
 
     public readonly string $spanId;
@@ -72,8 +75,8 @@ final class Span
         if ($continued !== null) {
             [$this->traceId, $this->parentSpanId, $this->sampled] = $continued;
             $this->remoteParent = true;
-            $this->tracestate = $tracestate;
-            $this->baggage = $baggage;
+            $this->tracestate = self::passOn($tracestate);
+            $this->baggage = self::passOn($baggage);
             $this->segment = $this;
         } elseif ($parent !== null) {
             $this->traceId = $parent->traceId;
@@ -165,6 +168,15 @@ final class Span
         }
 
         return [strtolower($p[1]), strtolower($p[2]), (hexdec($p[3]) & 1) === 1];
+    }
+
+    /**
+     * A caller's tracestate or baggage, to pass on as it came; null when it is too long, or holds
+     * what would end a header (it may come from a queue's payload rather than a header).
+     */
+    private static function passOn(?string $header): ?string
+    {
+        return $header === null || \strlen($header) > self::MAX_HEADER || strpbrk($header, "\r\n\0") !== false ? null : $header;
     }
 
     /** The W3C traceparent header that continues this span's trace in a service it calls. */

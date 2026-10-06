@@ -87,6 +87,26 @@ final class ProcessTest extends TestCase
         self::assertSame('nightly report sent', FakeIngest::anyValue($rec['body']));
     }
 
+    /** @param list<string> $php */
+    #[DataProvider('transports')]
+    public function testDoesNotFollowRedirects(array $php): void
+    {
+        // A redirect would take the key to wherever it points: here, the fake Fixwire.
+        $port = $this->serve(__DIR__ . '/fixtures/redirect.php', ['REDIRECT_TO' => str_replace('publickey@', '', $this->dsn) . '/v1/logs']);
+        [$code] = $this->script('message', $php, "http://publickey@127.0.0.1:{$port}");
+        self::assertSame(0, $code);
+        self::assertSame('', file_get_contents($this->log));
+    }
+
+    /** @param list<string> $php */
+    #[DataProvider('transports')]
+    public function testReadsLittleOfALongAnswer(array $php): void
+    {
+        $port = $this->serve(__DIR__ . '/fixtures/huge.php', []);
+        [$code, $out] = $this->script('message', ['-d', 'memory_limit=32M', ...$php], "http://publickey@127.0.0.1:{$port}");
+        self::assertSame(0, $code, $out);
+    }
+
     public function testTracksTheWebRequestPhpServes(): void
     {
         $port = $this->serve(__DIR__ . '/fixtures/web.php', ['FIXWIRE_DSN' => $this->dsn]);
@@ -148,14 +168,14 @@ final class ProcessTest extends TestCase
      *
      * @return array{int, string} its exit code and output
      */
-    private function script(string $scenario, array $php = []): array
+    private function script(string $scenario, array $php = [], ?string $dsn = null): array
     {
         $process = proc_open(
             [\PHP_BINARY, '-d', 'display_errors=stderr', ...$php, __DIR__ . '/fixtures/script.php', $scenario],
             [1 => ['pipe', 'w'], 2 => ['redirect', 1]],
             $pipes,
             null,
-            ['FIXWIRE_DSN' => $this->dsn] + getenv(),
+            ['FIXWIRE_DSN' => $dsn ?? $this->dsn] + getenv(),
         );
         self::assertIsResource($process);
         $out = (string) stream_get_contents($pipes[1]);

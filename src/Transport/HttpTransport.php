@@ -5,10 +5,14 @@ declare(strict_types=1);
 namespace Fixwire\Transport;
 
 /**
- * Sends with curl when it is there, else with PHP's streams.
+ * Sends with curl when it is there, else with PHP's streams. Redirects are not followed (the key
+ * must not go to another host), and the answer's body is not kept.
  */
 final class HttpTransport implements Transport
 {
+    /** The bytes of an answer's body read before the transfer is cut short. */
+    private const MAX_BODY = 64 * 1024;
+
     public function __construct(private float $timeout = 2.0) {}
 
     public function send(string $url, string $body, array $headers): array
@@ -24,6 +28,7 @@ final class HttpTransport implements Transport
     private function curl(string $url, string $body, array $headers): array
     {
         $answer = [];
+        $read = 0;
         $c = curl_init($url);
         if ($c === false) {
             return [0, []];
@@ -32,7 +37,12 @@ final class HttpTransport implements Transport
             \CURLOPT_POST => true,
             \CURLOPT_POSTFIELDS => $body,
             \CURLOPT_HTTPHEADER => array_map(static fn(string $k, string $v): string => "{$k}: {$v}", array_keys($headers), $headers),
-            \CURLOPT_RETURNTRANSFER => true,
+            // The body is thrown away; past MAX_BODY, taking less than given ends the transfer.
+            \CURLOPT_WRITEFUNCTION => static function ($c, string $data) use (&$read): int {
+                $read += \strlen($data);
+
+                return $read > self::MAX_BODY ? 0 : \strlen($data);
+            },
             \CURLOPT_TIMEOUT_MS => (int) ($this->timeout * 1000),
             \CURLOPT_CONNECTTIMEOUT_MS => (int) min($this->timeout * 1000, 1000),
             \CURLOPT_HEADERFUNCTION => static function ($c, string $line) use (&$answer): int {
@@ -45,7 +55,7 @@ final class HttpTransport implements Transport
             },
         ]);
         $ok = curl_exec($c);
-        if ($ok === false) {
+        if ($ok === false && $read <= self::MAX_BODY) {
             return [0, ['error' => curl_error($c)]]; // no answer: why, for the debug log
         }
 
@@ -65,14 +75,14 @@ final class HttpTransport implements Transport
             'content' => $body,
             'timeout' => $this->timeout,
             'ignore_errors' => true,
+            'follow_location' => 0, // it would send the Authorization header on to the new place
         ]]);
         $stream = @fopen($url, 'rb', false, $context);
         if ($stream === false) {
             return [0, ['error' => error_get_last()['message'] ?? 'no answer']];
         }
-        // The http wrapper keeps the answer's status line and headers here.
+        // The http wrapper keeps the answer's status line and headers here; the body is not read.
         $lines = stream_get_meta_data($stream)['wrapper_data'] ?? [];
-        stream_get_contents($stream);
         fclose($stream);
         $status = 0;
         $answer = [];

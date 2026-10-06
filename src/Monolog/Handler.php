@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Fixwire\Monolog;
 
 use Fixwire\Breadcrumb;
+use Fixwire\Client;
 use Fixwire\Event;
 use Fixwire\Hub;
 use Fixwire\Level;
@@ -21,6 +22,9 @@ use Monolog\LogRecord;
  */
 final class Handler extends AbstractProcessingHandler
 {
+    /** Whether a record is being sent: what is logged meanwhile (by a before_send, say) is not sent too. */
+    private static bool $writing = false;
+
     public function __construct(
         private MonologLevel $breadcrumbLevel = MonologLevel::Info,
         private MonologLevel $eventLevel = MonologLevel::Error,
@@ -33,9 +37,19 @@ final class Handler extends AbstractProcessingHandler
     {
         $hub = Hub::current();
         $client = $hub->getClient();
-        if ($client === null || !$client->isEnabled() || str_starts_with($record->channel, 'fixwire')) {
+        if (self::$writing || $client === null || !$client->isEnabled() || str_starts_with($record->channel, 'fixwire')) {
             return;
         }
+        self::$writing = true;
+        try {
+            $this->send($hub, $client, $record);
+        } finally {
+            self::$writing = false;
+        }
+    }
+
+    private function send(Hub $hub, Client $client, LogRecord $record): void
+    {
         $level = self::levelOf($record->level);
         $context = $record->context;
         $exception = $context['exception'] ?? null;

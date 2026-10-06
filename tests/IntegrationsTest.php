@@ -127,6 +127,22 @@ final class IntegrationsTest extends TestCase
         self::assertSame('already sent', FakeIngest::kv($recs[2]['attributes'])['exception.message']);
     }
 
+    public function testSendsOnceWhenSendingLogsAgain(): void
+    {
+        $log = new Logger('shop');
+        $log->pushHandler(new \Fixwire\Monolog\Handler());
+        $ingest = new FakeIngest();
+        $hub = $ingest->hub(['before_send' => static function (\Fixwire\Event $e) use ($log): \Fixwire\Event {
+            $log->error('sending ' . $e->message);
+
+            return $e;
+        }]);
+        $log->error('payment declined');
+        $hub->flush();
+        $recs = FakeIngest::logRecords($ingest->requests('/v1/logs'));
+        self::assertSame(['payment declined'], array_map(static fn(array $r): mixed => FakeIngest::anyValue($r['body']), $recs));
+    }
+
     public function testTracksPsr15Requests(): void
     {
         $ingest = new FakeIngest();

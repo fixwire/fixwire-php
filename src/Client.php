@@ -28,6 +28,15 @@ final class Client
     /** The log records and spans per request to Fixwire. */
     private const BATCH = 100;
 
+    /** The bytes of log records or spans per request: under the protocol's 5 MB. */
+    private const BATCH_BYTES = 4 * 1024 * 1024;
+
+    /** The longest pause an answer can ask for, in seconds (as long as APCu keeps it). */
+    private const MAX_PAUSE = 3600;
+
+    /** How bodies are encoded (and batches measured). */
+    private const JSON = \JSON_UNESCAPED_SLASHES | \JSON_UNESCAPED_UNICODE | \JSON_INVALID_UTF8_SUBSTITUTE | \JSON_PRESERVE_ZERO_FRACTION | \JSON_PARTIAL_OUTPUT_ON_ERROR;
+
     private readonly Options $options;
 
     private readonly ?Dsn $dsn;
@@ -51,6 +60,9 @@ final class Client
 
     /** @var \WeakMap<\Throwable, bool> */
     private \WeakMap $captured;
+
+    /** Whether a request of this flush got no answer: the rest are dropped, not each waiting as long. */
+    private bool $unreachable = false;
 
     /** @var array<string, float> category ("" for all) → paused until, within this process */
     private static array $paused = [];
@@ -260,7 +272,7 @@ final class Client
     {
         $message = trim((string) $f->message);
         $score = is_finite($f->score) ? max(-1.0, min(1.0, $f->score)) : 0.0;
-        if ($this->dsn === null || ($message === '' && $score == 0)) {
+        if ($this->dsn === null || ($message === '' && $score == 0) || !$this->room()) {
             return null;
         }
         $user = $scope->getUser();
@@ -299,6 +311,7 @@ final class Client
             return true;
         }
         $ok = true;
+        $this->unreachable = false;
         $session = $this->sessions?->take($this->options);
         if ($session !== null) {
             $this->requests[] = ['/v1/sessions', self::SESSION, $session];
@@ -307,10 +320,10 @@ final class Client
         $spans = $this->spans;
         $requests = $this->requests;
         $this->records = $this->spans = $this->requests = [];
-        foreach (array_chunk($records, self::BATCH) as $batch) {
+        foreach (self::batches($records) as $batch) {
             $ok = $this->send('/v1/logs', self::ERROR, fn(): array => Otlp::logs($this->options, $batch)) && $ok;
         }
-        foreach (array_chunk($spans, self::BATCH) as $batch) {
+        foreach (self::batches($spans) as $batch) {
             $ok = $this->send('/v1/traces', self::SPAN, fn(): array => Otlp::traces($this->options, $batch)) && $ok;
         }
         foreach ($requests as [$path, $category, $body]) {
@@ -327,6 +340,11 @@ final class Client
      */
     private function send(string $path, string $category, \Closure $body): bool
     {
+        if ($this->unreachable) {
+            $this->log("dropping a {$category} request: Fixwire did not answer");
+
+            return false;
+        }
         try {
             return $this->post($path, $category, $body());
         } catch (\Throwable $ex) {
@@ -348,7 +366,38 @@ final class Client
     }
 
     /**
-     * Sends one request now, honouring rate limits; one retry when there was no answer or a 5xx.
+     * Log records or spans in requests of at most BATCH of them and BATCH_BYTES of JSON (each
+     * measured once), so that one request too large for Fixwire doesn't lose the rest.
+     *
+     * @param list<array<string, mixed>> $items
+     *
+     * @return list<list<array<string, mixed>>>
+     */
+    private static function batches(array $items): array
+    {
+        $batches = [];
+        $batch = [];
+        $bytes = 0;
+        foreach ($items as $item) {
+            $size = \strlen((string) json_encode($item, self::JSON));
+            if ($batch !== [] && (\count($batch) === self::BATCH || $bytes + $size > self::BATCH_BYTES)) {
+                $batches[] = $batch;
+                $batch = [];
+                $bytes = 0;
+            }
+            $batch[] = $item;
+            $bytes += $size;
+        }
+        if ($batch !== []) {
+            $batches[] = $batch;
+        }
+
+        return $batches;
+    }
+
+    /**
+     * Sends one request now, honouring rate limits; one retry when there was no answer or a 5xx
+     * (unless it said when to come back).
      *
      * @param array<string, mixed> $body
      */
@@ -359,7 +408,7 @@ final class Client
 
             return false;
         }
-        $json = json_encode($body, \JSON_UNESCAPED_SLASHES | \JSON_UNESCAPED_UNICODE | \JSON_INVALID_UTF8_SUBSTITUTE | \JSON_PRESERVE_ZERO_FRACTION | \JSON_PARTIAL_OUTPUT_ON_ERROR);
+        $json = json_encode($body, self::JSON);
         if ($json === false) {
             $this->log("dropping a {$category} request: " . json_last_error_msg());
 
@@ -385,7 +434,11 @@ final class Client
 
                 return false;
             }
+            if ($this->paused($category)) {
+                break; // a 503 with Retry-After: not before then
+            }
         }
+        $this->unreachable = $status === 0;
         $this->log("dropping a {$category} request ({$status}" . (isset($answer['error']) ? ': ' . $answer['error'] : '') . ')');
 
         return false;
@@ -400,17 +453,22 @@ final class Client
         return ($paused[$category] ?? 0) > $now || ($paused[''] ?? 0) > $now;
     }
 
-    /** Reads Fixwire-Rate-Limits ("<seconds>:<category;…>, …"; no categories means all) and a bare 429. */
+    /**
+     * Reads Fixwire-Rate-Limits ("<seconds>:<category;…>, …"; no categories means all), a bare 429,
+     * and a 5xx's Retry-After (seconds; an HTTP date counts as none). Pauses are at most MAX_PAUSE.
+     */
     private function limit(?string $header, int $status, ?string $retryAfter): void
     {
         $now = microtime(true);
         $changed = false;
         if ($header === null && $status === 429) {
             $header = max((int) $retryAfter, 60) . ':';
+        } elseif ($header === null && $status >= 500 && (int) $retryAfter > 0) {
+            $header = (int) $retryAfter . ':';
         }
         foreach ($header === null ? [] : explode(',', $header) as $part) {
             $sc = explode(':', trim($part), 2);
-            $secs = (int) $sc[0];
+            $secs = min((int) $sc[0], self::MAX_PAUSE);
             if ($secs <= 0) {
                 continue;
             }

@@ -528,4 +528,156 @@ final class FixwireTest extends TestCase
         self::assertSame('warning', $crumb['level']);
         self::assertSame('php', $crumb['category']);
     }
+
+    public function testBudgetsHugeMessagesQuickly(): void
+    {
+        // The email part of the budget's pattern is quadratic: 300 kB of these took seconds.
+        $start = microtime(true);
+        foreach (['a@', 'a@a', '@.', '@a.'] as $unit) {
+            $e = new Event();
+            $e->message = str_repeat($unit, 100_000);
+            Budget::issueOf($e);
+        }
+        self::assertLessThan(1.0, microtime(true) - $start);
+        $long = new Event();
+        $long->message = str_repeat('x', 2000) . ' order 1';
+        $other = new Event();
+        $other->message = str_repeat('x', 2000) . ' cart 2';
+        self::assertSame(Budget::issueOf($long), Budget::issueOf($other), 'the start of a message tells its issue');
+    }
+
+    public function testBudgetKeepsIssuesWhoseHashLooksLikeANumber(): void
+    {
+        // PHP makes such keys integers; evicting the oldest must not renumber the rest.
+        $budget = new Budget(['per_issue_burst' => 1, 'per_issue_per_minute' => 0, 'per_minute' => 1e6]);
+        $now = microtime(true);
+        for ($i = 0; $i < 1024; $i++) {
+            self::assertSame(0, $budget->allow((string) (1_000_000_000_000_000 + $i), $now));
+        }
+        self::assertSame(0, $budget->allow('fresh', $now)); // evicts the oldest
+        self::assertSame(-1, $budget->allow('1000000000000005', $now), 'its burst is spent');
+    }
+
+    public function testKeepsTheLastBreadcrumbsCheaply(): void
+    {
+        $scope = new Scope();
+        for ($i = 0; $i < 250; $i++) {
+            $scope->addBreadcrumb(new Breadcrumb('n', (string) $i), 100);
+        }
+        $e = new Event();
+        $scope->applyTo($e, null);
+        self::assertSame(range(150, 249), array_map(static fn(Breadcrumb $b): int => (int) $b->message, $e->breadcrumbs));
+
+        $start = microtime(true);
+        $big = new Scope();
+        for ($i = 0; $i < 100_000; $i++) {
+            $big->addBreadcrumb(new Breadcrumb('n', 'x'), 10_000);
+        }
+        self::assertLessThan(1.0, microtime(true) - $start, 'adding one does not copy them all');
+    }
+
+    public function testIgnoresABeforeBreadcrumbThatReturnsSomethingElse(): void
+    {
+        $ingest = new FakeIngest();
+        $hub = $ingest->hub(['before_breadcrumb' => static fn(Breadcrumb $b): mixed => 'not a breadcrumb']);
+        $hub->addBreadcrumb(new Breadcrumb('cart', 'loaded'));
+        $hub->captureMessage('after');
+        $hub->flush();
+        self::assertArrayNotHasKey('fixwire.breadcrumbs', FakeIngest::kv(FakeIngest::logRecords($ingest->requests())[0]['attributes']));
+    }
+
+    public function testCapsPausesAndHonoursRetryAfterOn5xx(): void
+    {
+        $ingest = new FakeIngest();
+        $ingest->answer = static fn(int $n): array => match ($n) {
+            0 => [429, ['retry-after' => '99999999999999']],
+            default => [200, []],
+        };
+        $hub = $ingest->hub();
+        $hub->captureMessage('first');
+        self::assertFalse($hub->flush());
+        $paused = (new \ReflectionProperty(Client::class, 'paused'))->getValue();
+        self::assertIsArray($paused);
+        self::assertLessThanOrEqual(microtime(true) + 3600, $paused['']);
+
+        Client::resetRateLimits();
+        $ingest = new FakeIngest();
+        $ingest->answer = static fn(int $n): array => [503, ['retry-after' => '30']];
+        $hub = $ingest->hub();
+        $hub->captureMessage('first');
+        self::assertFalse($hub->flush());
+        self::assertCount(1, $ingest->requests(), 'not retried before Retry-After');
+        $hub->captureMessage('second');
+        self::assertFalse($hub->flush());
+        self::assertCount(1, $ingest->requests(), 'paused');
+    }
+
+    public function testStopsAFlushWhenFixwireDoesNotAnswer(): void
+    {
+        $ingest = new FakeIngest();
+        $ingest->answer = static fn(): array => [0, ['error' => 'Connection timed out']];
+        $hub = $ingest->hub(['traces_sample_rate' => 1.0]);
+        $hub->captureMessage('one');
+        $hub->startSpan('job')->finish();
+        $hub->captureFeedback(new Feedback('slow'));
+        self::assertFalse($hub->flush());
+        self::assertCount(2, $ingest->requests(), 'the logs, tried twice; not the spans nor the feedback');
+        $hub->captureMessage('two');
+        self::assertFalse($hub->flush());
+        self::assertCount(4, $ingest->requests(), 'the next flush tries again');
+    }
+
+    public function testSplitsBatchesByTheirSize(): void
+    {
+        $ingest = new FakeIngest();
+        $hub = $ingest->hub(['redact' => false, 'max_queue' => 200, 'error_budget' => ['enabled' => false]]);
+        for ($i = 0; $i < 150; $i++) {
+            $hub->captureMessage("small {$i}");
+        }
+        for ($i = 0; $i < 3; $i++) {
+            $hub->captureMessage(str_repeat((string) $i, 5 * 1024 * 1024 / 2));
+        }
+        self::assertTrue($hub->flush());
+        $requests = $ingest->requests('/v1/logs');
+        self::assertSame([100, 51, 1, 1], array_map(static fn(array $r): int => \count(FakeIngest::logRecords([$r])), $requests));
+        foreach ($requests as $r) {
+            self::assertLessThan(5 * 1024 * 1024, \strlen((string) json_encode($r['body'])), 'within the protocol\'s 5 MB');
+        }
+    }
+
+    public function testCapsTheQueueForFeedbackToo(): void
+    {
+        $ingest = new FakeIngest();
+        $hub = $ingest->hub(['max_queue' => 2]);
+        self::assertNotNull($hub->captureFeedback(new Feedback('one')));
+        self::assertNotNull($hub->captureFeedback(new Feedback('two')));
+        self::assertNull($hub->captureFeedback(new Feedback('three')));
+    }
+
+    public function testReadsOnlySomeOfAnEndlessIterator(): void
+    {
+        $ingest = new FakeIngest();
+        $hub = $ingest->hub();
+        $endless = (static function (): \Generator {
+            for ($i = 0; ; $i++) {
+                yield $i;
+            }
+        })();
+        $hub->getScope()->setExtra('rows', $endless);
+        self::assertNotNull($hub->captureMessage('with a cursor'));
+        $hub->flush();
+        self::assertCount(1000, FakeIngest::kv(FakeIngest::logRecords($ingest->requests())[0]['attributes'])['rows']);
+    }
+
+    public function testPassesOnOnlyWellFormedTraceHeaders(): void
+    {
+        $hub = (new FakeIngest())->hub();
+        $traceparent = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
+        $long = $hub->continueTrace($traceparent, 'fw=' . str_repeat('a', 9000), str_repeat('k=v,', 3000), 'GET /');
+        self::assertSame([null, null], [$long->tracestate, $long->baggage]);
+        $long->finish();
+        $split = $hub->continueTrace($traceparent, "fw=1\r\nX-Injected: 1", "user=1\nX: 2", 'GET /');
+        self::assertSame([null, null], [$split->tracestate, $split->baggage]);
+        $split->finish();
+    }
 }

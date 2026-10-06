@@ -21,8 +21,11 @@ final class Scope
     /** @var array<string, mixed> */
     private array $extra = [];
 
-    /** @var list<Breadcrumb> */
+    /** @var list<Breadcrumb> the newest last; up to twice the most kept, as the oldest go in bulk */
     private array $breadcrumbs = [];
+
+    /** The breadcrumbs kept: the last $max given to addBreadcrumb(). */
+    private int $maxBreadcrumbs = 100;
 
     private ?Level $level = null;
 
@@ -155,7 +158,9 @@ final class Scope
         }
         $breadcrumb->timestamp ??= microtime(true);
         $this->breadcrumbs[] = $breadcrumb;
-        if (\count($this->breadcrumbs) > $max) {
+        $this->maxBreadcrumbs = $max;
+        // Trimmed once there are twice as many, so that adding one doesn't copy them all.
+        if (\count($this->breadcrumbs) >= 2 * $max) {
             $this->breadcrumbs = \array_slice($this->breadcrumbs, -$max);
         }
 
@@ -189,7 +194,7 @@ final class Scope
         $e->contexts += $this->contexts;
         $e->extra += $this->extra;
         if ($e->breadcrumbs === []) {
-            $e->breadcrumbs = $this->breadcrumbs;
+            $e->breadcrumbs = \count($this->breadcrumbs) > $this->maxBreadcrumbs ? \array_slice($this->breadcrumbs, -$this->maxBreadcrumbs) : $this->breadcrumbs;
         }
         $e->level ??= $this->level;
         if ($e->fingerprint === []) {

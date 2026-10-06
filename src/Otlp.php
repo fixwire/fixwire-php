@@ -13,6 +13,9 @@ final class Otlp
 {
     private const MAX_DEPTH = 10;
 
+    /** The items read from an iterator (a Traversable that is not an array). */
+    private const MAX_ITEMS = 1000;
+
     /** @return array<string, mixed> */
     public static function resource(Options $o): array
     {
@@ -249,7 +252,11 @@ final class Otlp
                 }
             }
             $out = [];
-            foreach ($v instanceof \Traversable ? iterator_to_array($v) : (array) $v as $k => $item) {
+            $n = 0;
+            foreach ($v instanceof \Traversable ? $v : (array) $v as $k => $item) {
+                if ($v instanceof \Traversable && $n++ === self::MAX_ITEMS) {
+                    break; // it may be lazy (a database cursor) or endless (a generator)
+                }
                 $out[$k] = self::plain($item, $depth + 1);
             }
 
