@@ -86,16 +86,35 @@ final class Client
     private static array $paused = [];
 
     /**
-     * @throws \InvalidArgumentException for a malformed DSN
+     * Never throws: a malformed DSN, or an option that is broken, is said on PHP's error log (stderr
+     * in the CLI), whether or not debug is on, and the client stays off.
      */
     public function __construct(Options $options)
     {
         $options->applyDefaults();
         $this->options = $options;
-        $this->budget = new Budget($options->errorBudget);
-        $this->redactor = $options->redact ? Redactor::create($options->sensitiveKeys) : null;
+        $problems = $options->problems();
+        try {
+            $budget = new Budget($options->errorBudget);
+            $redactor = $options->redact ? Redactor::create($options->sensitiveKeys) : null;
+        } catch (\Throwable $e) {
+            $problems[] = 'error_budget or sensitive_keys: ' . $e->getMessage();
+            [$budget, $redactor] = [new Budget([]), null];
+        }
+        $this->budget = $budget;
+        $this->redactor = $redactor;
         $this->transport = $options->transport ?? new HttpTransport($options->timeout);
-        $this->dsn = Options::empty($options->dsn) ? null : Dsn::parse((string) $options->dsn);
+        $dsn = null;
+        try {
+            $dsn = Options::empty($options->dsn) ? null : Dsn::parse((string) $options->dsn);
+        } catch (\InvalidArgumentException) {
+            $problems[] = 'the DSN must look like https://<key>@<host>';
+        }
+        if ($problems !== []) {
+            error_log('fixwire: nothing is sent: ' . implode('; ', $problems));
+            $dsn = null;
+        }
+        $this->dsn = $dsn;
         $this->sessions = $this->dsn !== null && $options->sessionsOn() ? new Sessions() : null;
         $this->captured = new \WeakMap();
         $this->pid = (int) getmypid();
@@ -355,10 +374,13 @@ final class Client
         if ($checkIn->config !== null) {
             $body['monitor_config'] = $checkIn->config->toWire();
         }
+        // The app's own configuration (the slug too): cut, not redacted.
+        $limit = $this->options->maxValueLength;
+        $body = Otlp::cut($body, $limit);
 
         $deadline = microtime(true) + $this->options->timeout;
 
-        return $this->post('/v1/check-ins/' . rawurlencode($checkIn->monitor), self::CHECK_IN, $body, $deadline) ? $id : null;
+        return $this->post('/v1/check-ins/' . rawurlencode(Otlp::cutString($checkIn->monitor, $limit)), self::CHECK_IN, $body, $deadline) ? $id : null;
     }
 
     /** @internal queues feedback: its id, or null when not sent (never throws) */
@@ -393,7 +415,8 @@ final class Client
         }
         $body = Otlp::fields($body, $this->redactor, $this->options->maxValueLength);
         $id = Ids::new(16);
-        $body += array_filter([
+        // The app's own configuration: cut, not redacted.
+        $body += Otlp::cut(array_filter([
             'sdk' => self::sdk(),
             'feedback_id' => $id,
             'timestamp' => microtime(true),
@@ -402,7 +425,7 @@ final class Client
             'trace_id' => $f->traceId ?? $span?->traceId,
             'event_id' => $f->eventId,
             'release' => $this->options->release,
-        ], static fn($v) => $v !== null);
+        ], static fn($v) => $v !== null), $this->options->maxValueLength);
         $this->requests[] = ['/v1/feedback', self::FEEDBACK, $body];
 
         return $id;

@@ -116,26 +116,45 @@ final class Options
     /** Sends to Fixwire; for tests (default: curl, else PHP streams). */
     public ?Transport $transport = null;
 
+    /** @var list<string> what fromArray could not take */
+    private array $problems = [];
+
     /**
-     * @param array<string, mixed> $options snake_case keys, as in the docs
+     * Never throws: an option that doesn't exist, or a value of the wrong type, is left out, and
+     * the client made with these options says so on PHP's error log and stays off.
      *
-     * @throws \InvalidArgumentException for an option that doesn't exist
+     * @param array<string, mixed> $options snake_case keys, as in the docs
      */
     public static function fromArray(array $options): self
     {
         $o = new self();
         foreach ($options as $key => $value) {
             $property = lcfirst(str_replace('_', '', ucwords((string) $key, '_')));
-            if (!property_exists($o, $property)) {
-                throw new \InvalidArgumentException("fixwire: no option '{$key}'");
+            if ($property === 'problems' || !property_exists($o, $property)) {
+                $o->problems[] = "no option '{$key}'";
+                continue;
             }
-            $o->{$property} = match ($property) {
-                'sampleRate', 'tracesSampleRate', 'timeout' => (float) $value,
-                default => $value,
-            };
+            try {
+                $o->{$property} = match ($property) {
+                    'sampleRate', 'tracesSampleRate', 'timeout' => \is_scalar($value) || $value === null ? (float) $value : throw new \TypeError(),
+                    default => $value,
+                };
+            } catch (\TypeError) {
+                $o->problems[] = "option '{$key}' can't be " . get_debug_type($value);
+            }
         }
 
         return $o;
+    }
+
+    /**
+     * @internal what fromArray could not take
+     *
+     * @return list<string>
+     */
+    public function problems(): array
+    {
+        return $this->problems;
     }
 
     /** @internal fills in what is not set, from the environment */

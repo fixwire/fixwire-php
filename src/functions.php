@@ -24,9 +24,10 @@ namespace Fixwire;
  * Sets the SDK up: the current hub gets a client for the options, uncaught exceptions and fatal
  * errors are reported, and what was captured is sent at the end of the request or script.
  *
- * @param array<string, mixed>|Options $options snake_case keys, as in the docs
+ * Never throws: an option that doesn't exist or is of the wrong type, or a malformed DSN, is said
+ * on PHP's error log (stderr in the CLI) and the SDK stays off, so a typo can't stop the app.
  *
- * @throws \InvalidArgumentException for an unknown option or a malformed DSN
+ * @param array<string, mixed>|Options $options snake_case keys, as in the docs
  */
 function init(array|Options $options = []): Client
 {

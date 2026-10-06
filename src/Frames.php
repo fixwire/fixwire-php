@@ -17,7 +17,7 @@ final class Frames
     private const MAX_SOURCES = 64;
 
     /** The bytes of the files the cache holds, before it starts again. */
-    private const MAX_CACHED_BYTES = 16 * 1024 * 1024;
+    private const MAX_CACHED_BYTES = 32 * 1024 * 1024;
 
     /** @var array<string, string> file → its text */
     private static array $sources = [];

@@ -18,6 +18,7 @@ use Fixwire\Hub;
 use Fixwire\Level;
 use Fixwire\MonitorConfig;
 use Fixwire\Options;
+use Fixwire\Otlp;
 use Fixwire\Scope;
 use Fixwire\Sessions;
 use Fixwire\Span;
@@ -92,10 +93,56 @@ final class FixwireTest extends TestCase
         self::assertSame(['src/Cart.php', 'D:/tools/run.php'], [$inApp->file, $outside->file]);
     }
 
-    public function testRejectsUnknownOptions(): void
+    public function testInitNeverThrowsAndSaysWhatIsBroken(): void
     {
-        $this->expectException(\InvalidArgumentException::class);
-        Options::fromArray(['dsm' => 'typo']);
+        $o = Options::fromArray(['dsm' => 'typo', 'problems' => [], 'max_queue' => 'ten', 'sample_rate' => [], 'timeout' => '1.5', 'release' => 'shop@1.0.0']);
+        self::assertSame(["no option 'dsm'", "no option 'problems'", "option 'max_queue' can't be string", "option 'sample_rate' can't be array"], $o->problems());
+        self::assertSame([1.5, 'shop@1.0.0', 100], [$o->timeout, $o->release, $o->maxQueue], 'the rest is taken');
+
+        $off = ['capture_uncaught' => false, 'track_request' => false, 'debug' => false];
+        foreach ([
+            [['dsn' => FakeIngest::DSN, 'dsm' => 'typo'], "no option 'dsm'"],
+            [['dsn' => FakeIngest::DSN, 'max_queue' => '10'], "option 'max_queue' can't be string"],
+            [['dsn' => 'ingest.fixwire.io'], 'the DSN must look like https://<key>@<host>'],
+            [['dsn' => 'https://@ingest.fixwire.io'], 'the DSN must look like https://<key>@<host>'],
+            [['dsn' => FakeIngest::DSN, 'sensitive_keys' => [42]], 'error_budget or sensitive_keys'],
+            [['dsm' => 'typo'], "no option 'dsm'"], // said without a DSN too
+        ] as $i => [$options, $said]) {
+            $ingest = new FakeIngest();
+            Hub::setCurrent(new Hub());
+            $client = null;
+            $log = self::errorLog(static function () use ($options, $off, $ingest, &$client): void {
+                $client = \Fixwire\init($options + $off + ['transport' => $ingest]);
+            });
+            self::assertInstanceOf(Client::class, $client);
+            self::assertFalse($client->isEnabled(), "case {$i}: off");
+            self::assertStringContainsString('fixwire: nothing is sent: ' . $said, $log, "case {$i}");
+            self::assertNull(\Fixwire\captureMessage('lost'));
+            \Fixwire\flush();
+            self::assertSame([], $ingest->requests(), "case {$i}");
+        }
+        Hub::setCurrent(new Hub());
+
+        $log = self::errorLog(static function () use ($off): void {
+            self::assertTrue((new Client(Options::fromArray(['dsn' => FakeIngest::DSN, 'transport' => new FakeIngest()] + $off)))->isEnabled());
+        });
+        self::assertSame('', $log, 'a good configuration says nothing');
+    }
+
+    /** What $work writes on PHP's error log. */
+    private static function errorLog(\Closure $work): string
+    {
+        $file = (string) tempnam(sys_get_temp_dir(), 'fixwire-log');
+        $previous = ini_set('error_log', $file);
+        try {
+            $work();
+        } finally {
+            ini_set('error_log', $previous === false ? '' : $previous);
+        }
+        $log = (string) file_get_contents($file);
+        unlink($file);
+
+        return $log;
     }
 
     public function testDoesNothingWithoutADsn(): void
@@ -443,6 +490,77 @@ final class FixwireTest extends TestCase
         self::assertFalse($hub->flush());
         self::assertCount(2, $ingest->requests('/v1/logs'));
         self::assertCount(1, $ingest->requests('/v1/feedback'));
+    }
+
+    public function testSendsARequestAtMostTwiceWithinTheProtocolsFour(): void
+    {
+        foreach ([[503, 2], [429, 1]] as [$status, $sent]) {
+            Client::resetRateLimits();
+            $ingest = new FakeIngest();
+            $ingest->answer = static fn(): array => [$status, []];
+            $hub = $ingest->hub(['timeout' => 10.0]);
+            $hub->captureMessage('first');
+            self::assertFalse($hub->flush());
+            self::assertCount($sent, $ingest->requests('/v1/logs'), "{$status}: a 429's pause is not waited out at exit");
+        }
+    }
+
+    public function testCachesSourceFilesUpTo64FilesAnd32MB(): void
+    {
+        $sources = new \ReflectionProperty(Frames::class, 'sources');
+        $bytes = new \ReflectionProperty(Frames::class, 'cachedBytes');
+        $read = new \ReflectionMethod(Frames::class, 'read');
+        $size = (int) filesize(__FILE__);
+        $files = static fn(int $n): array => array_fill_keys(array_map(static fn(int $i): string => "/src/{$i}.php", range(1, $n)), '');
+        try {
+            $sources->setValue(null, $files(1));
+            $bytes->setValue(null, 32 * 1024 * 1024 - $size);
+            self::assertNotSame('', $read->invoke(null, __FILE__));
+            self::assertSame([$files(1), 32 * 1024 * 1024], [$sources->getValue(), $bytes->getValue()], 'exactly 32 MB: kept');
+
+            $bytes->setValue(null, 32 * 1024 * 1024 - $size + 1);
+            $read->invoke(null, __FILE__);
+            self::assertSame([[], $size], [$sources->getValue(), $bytes->getValue()], 'a byte over: starts again');
+
+            $sources->setValue(null, $files(63));
+            $read->invoke(null, __FILE__);
+            self::assertCount(63, $sources->getValue(), 'the 64th file fits');
+            $sources->setValue(null, $files(64));
+            $read->invoke(null, __FILE__);
+            self::assertSame([], $sources->getValue(), 'the 65th starts again');
+        } finally {
+            $sources->setValue(null, []);
+            $bytes->setValue(null, 0);
+        }
+    }
+
+    public function testCutsButDoesNotRedactTheAppsConfiguration(): void
+    {
+        $release = 'api@1.2.3.example.com';
+        $long = 'production-' . str_repeat('e', 40);
+        $ingest = new FakeIngest();
+        $hub = $ingest->hub(['release' => $release, 'environment' => $long, 'server_name' => 'ada@example.com', 'service_name' => 'api', 'max_value_length' => 32, 'auto_session_tracking' => true]);
+        $cut = Otlp::cutString($long, 32);
+        self::assertSame(32, \strlen($cut));
+
+        $hub->captureFeedback(new Feedback('mail ada@example.com about it', name: 'Ada', email: 'ada@example.com', url: 'https://shop.example/orders?token=' . str_repeat('x', 40)));
+        \Fixwire\captureCheckIn(new \Fixwire\CheckIn('nightly-' . str_repeat('r', 40), CheckInStatus::Ok, config: MonitorConfig::crontab('0 3 * * *', timezone: 'Europe/' . str_repeat('z', 40))));
+        $end = $hub->startRequestSession();
+        $hub->captureMessage('x');
+        $end();
+        $hub->flush();
+
+        $fb = $ingest->requests('/v1/feedback')[0]['body'];
+        self::assertSame([$release, $cut], [$fb['release'], $fb['environment']], 'release and environment as given, cut');
+        self::assertSame(['mail [REDACTED:email] about it', '[REDACTED:email]'], [$fb['message'], $fb['email']], 'feedback is the app\'s data: redacted');
+        self::assertLessThanOrEqual(32, \strlen($fb['url']));
+        $checkIn = $ingest->requests()[0];
+        self::assertSame('/v1/check-ins/' . Otlp::cutString('nightly-' . str_repeat('r', 40), 32), $checkIn['path']);
+        self::assertSame([$cut, 32], [$checkIn['body']['environment'], \strlen($checkIn['body']['monitor_config']['timezone'])]);
+        $session = $ingest->requests('/v1/sessions')[0]['body'];
+        self::assertSame([$release, $cut], [$session['release'], $session['environment']]);
+        $res = FakeIngest::resource($ingest->requests('/v1/logs')[0]);
+        self::assertSame([$release, $cut, 'ada@example.com'], [$res['service.version'], $res['deployment.environment.name'], $res['host.name']]);
     }
 
     public function testNeverThrowsIntoTheApp(): void
@@ -899,11 +1017,22 @@ final class FixwireTest extends TestCase
         self::assertSame([null, null], $at($state512 . 'a', $baggage8192 . 'v'), 'dropped whole, not cut');
         self::assertSame([null, null], $at("fw=1\r\nX-Injected: 1", "user=1\nX: 2"));
         self::assertSame([null, null], $at("fw=1\x00", "user=1\x7F"));
+        self::assertSame([null, null], $at("fw=1,\x08other=2", "user=1,\x0Bid=2"), 'the control characters next to tab');
+        self::assertSame([null, null], $at("fw=1\x1F", "user=1\x0C"));
         self::assertSame(["fw=1,\tother=2", "user=1,\tid=2"], $at("fw=1,\tother=2", "user=1,\tid=2"), 'tabs are spaces');
+        $upper = $hub->continueTrace('00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-01', 'fw=1', 'user=1', 'GET /');
+        $upper->finish();
+        self::assertSame([null, null, null], [$upper->parentSpanId, $upper->tracestate, $upper->baggage], 'an upper-case traceparent is ignored');
+        self::assertNotSame('4bf92f3577b34da6a3ce929d0e0e4736', strtolower($upper->traceId));
 
         foreach ([
             '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' => true,
-            ' 00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-00 ' => true,
+            ' 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00 ' => true,
+            '00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-00' => false, // W3C: lower-case hex only
+            '00-4bf92f3577b34da6a3ce929d0e0e473A-00f067aa0ba902b7-01' => false,
+            '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902bF-01' => false,
+            '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0A' => false,
+            '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0a' => true,
             '01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' => false,
             'ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' => false,
             '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra' => false,

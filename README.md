@@ -166,7 +166,9 @@ ends. A negative score opens a `user_feedback` issue for the agent run.
 | `max_breadcrumbs`, `max_queue` | 100, 100 | |
 | `timeout` | 2 s | How long a flush may take (at exit, the request waits for it) |
 
-An option that doesn't exist is an error, so a typo doesn't go unnoticed.
+`init` never throws: an option that doesn't exist or has the wrong type, or
+a malformed DSN, is said on PHP's error log (stderr in the CLI) and the SDK
+stays off, so a typo neither goes unnoticed nor stops the app.
 
 ## Examples
 

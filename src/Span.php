@@ -158,8 +158,9 @@ final class Span
     }
 
     /**
-     * Reads 00-<trace id>-<parent id>-<flags>: version 00, a non-zero 32-hex trace id, a non-zero
-     * 16-hex parent id and 2-hex flags; null otherwise.
+     * Reads 00-<trace id>-<parent id>-<flags> as W3C defines it: version 00, exactly four fields of
+     * lower-case hex, a non-zero 32-hex trace id, a non-zero 16-hex parent id and 2-hex flags; null
+     * otherwise (upper-case hex too).
      *
      * @internal
      *
@@ -171,11 +172,11 @@ final class Span
         if (\count($p) !== 4 || $p[0] !== '00' || \strlen($p[1]) !== 32 || \strlen($p[2]) !== 16 || \strlen($p[3]) !== 2) {
             return null;
         }
-        if (!ctype_xdigit($p[1] . $p[2] . $p[3]) || trim($p[1], '0') === '' || trim($p[2], '0') === '') {
+        if (strspn($p[1] . $p[2] . $p[3], '0123456789abcdef') !== 50 || trim($p[1], '0') === '' || trim($p[2], '0') === '') {
             return null;
         }
 
-        return [strtolower($p[1]), strtolower($p[2]), (hexdec($p[3]) & 1) === 1];
+        return [$p[1], $p[2], (hexdec($p[3]) & 1) === 1];
     }
 
     /**

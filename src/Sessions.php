@@ -54,13 +54,10 @@ final class Sessions
             $aggregates[] = $a;
         }
         $this->buckets = $this->users = [];
+        // The app's own configuration: cut, not redacted.
+        $config = Otlp::cut(['release' => $options->release, 'environment' => $options->environment], $options->maxValueLength);
 
-        return array_map(static fn(array $chunk): array => [
-            'sdk' => Client::sdk(),
-            'release' => $options->release,
-            'environment' => $options->environment,
-            'aggregates' => $chunk,
-        ], array_chunk($aggregates, self::MAX_AGGREGATES));
+        return array_map(static fn(array $chunk): array => ['sdk' => Client::sdk()] + $config + ['aggregates' => $chunk], array_chunk($aggregates, self::MAX_AGGREGATES));
     }
 
     /**
