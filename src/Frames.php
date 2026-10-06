@@ -95,11 +95,18 @@ final class Frames
         return $f;
     }
 
-    /** The file as the app sees it: relative to the project root when it is under it. */
+    /**
+     * The file as the app sees it: relative to the project root when it is under it, with forward
+     * slashes everywhere, so an error groups alike on Windows and elsewhere.
+     */
     private static function relative(?string $file, Options $options): ?string
     {
-        $root = $options->projectRoot;
-        if ($file !== null && $root !== null && $root !== '' && str_starts_with($file, $root . \DIRECTORY_SEPARATOR)) {
+        if ($file === null) {
+            return null;
+        }
+        $file = str_replace('\\', '/', $file);
+        $root = $options->projectRoot === null ? '' : str_replace('\\', '/', $options->projectRoot);
+        if ($root !== '' && str_starts_with($file, $root . '/')) {
             return substr($file, \strlen($root) + 1);
         }
 

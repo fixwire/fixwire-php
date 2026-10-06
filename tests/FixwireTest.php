@@ -13,6 +13,7 @@ use Fixwire\Event;
 use Fixwire\ExceptionValue;
 use Fixwire\Feedback;
 use Fixwire\Frame;
+use Fixwire\Frames;
 use Fixwire\Hub;
 use Fixwire\Level;
 use Fixwire\MonitorConfig;
@@ -81,6 +82,14 @@ final class FixwireTest extends TestCase
         } finally {
             unset($_SERVER['FIXWIRE_RELEASE'], $_ENV['FIXWIRE_ENVIRONMENT'], $_SERVER['FIXWIRE_DEBUG']);
         }
+    }
+
+    public function testFramePathsUseForwardSlashesOnEveryOs(): void
+    {
+        $o = Options::fromArray(['project_root' => 'C:\\www\\shop', 'context_lines' => 0]);
+        $inApp = Frames::at('Shop\\Cart', 'checkout', 'C:\\www\\shop\\src\\Cart.php', 12, $o);
+        $outside = Frames::at(null, 'main', 'D:\\tools\\run.php', 3, $o);
+        self::assertSame(['src/Cart.php', 'D:/tools/run.php'], [$inApp->file, $outside->file]);
     }
 
     public function testRejectsUnknownOptions(): void
