@@ -50,11 +50,11 @@ final class ExamplesTest extends TestCase
         ]);
         $base = "http://127.0.0.1:{$port}";
 
-        self::assertSame(200, $this->http('GET', "{$base}/products/sku_1")[0]);
-        self::assertSame(404, $this->http('GET', "{$base}/products/nope")[0]);
-        self::assertSame(201, $this->http('POST', "{$base}/orders", '{"sku":"sku_1","card":"4242424242424242"}', ['X-User-Id: user-1'])[0]);
-        self::assertSame(402, $this->http('POST', "{$base}/orders", '{"sku":"sku_2","card":"4000000000000002"}', ['X-User-Id: user-2'])[0]);
-        self::assertSame(500, $this->http('GET', "{$base}/admin/report")[0]);
+        $this->assertAnswered(200, $this->http('GET', "{$base}/products/sku_1"));
+        $this->assertAnswered(404, $this->http('GET', "{$base}/products/nope"));
+        $this->assertAnswered(201, $this->http('POST', "{$base}/orders", '{"sku":"sku_1","card":"4242424242424242"}', ['X-User-Id: user-1']));
+        $this->assertAnswered(402, $this->http('POST', "{$base}/orders", '{"sku":"sku_2","card":"4000000000000002"}', ['X-User-Id: user-2']));
+        $this->assertAnswered(500, $this->http('GET', "{$base}/admin/report"));
         $requests = $this->received(12); // a trace and a session per request, the two errors
 
         $events = $this->events($requests);
@@ -142,9 +142,9 @@ final class ExamplesTest extends TestCase
         $base = "http://127.0.0.1:{$port}/index.php";
         $traceparent = 'traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
 
-        self::assertSame(200, $this->http('GET', "{$base}?id=1001", null, [$traceparent])[0]);
-        self::assertSame(404, $this->http('GET', "{$base}?id=9")[0]);
-        self::assertSame(500, $this->http('GET', "{$base}?id=1002", null, ['Cookie: user_id=user-7'])[0]);
+        $this->assertAnswered(200, $this->http('GET', "{$base}?id=1001", null, [$traceparent]));
+        $this->assertAnswered(404, $this->http('GET', "{$base}?id=9"));
+        $this->assertAnswered(500, $this->http('GET', "{$base}?id=1002", null, ['Cookie: user_id=user-7']));
         $requests = $this->received(4); // a trace per request, the crash
 
         $events = $this->events($requests);
@@ -276,6 +276,33 @@ final class ExamplesTest extends TestCase
             \array_key_exists('kvlistValue', $v) => self::kv($v['kvlistValue']['values'] ?? []),
             default => null,
         };
+    }
+
+    /**
+     * Fails with what the app answered and what it reported, when the status isn't the one expected.
+     *
+     * @param array{int, string} $answer
+     */
+    private function assertAnswered(int $status, array $answer): void
+    {
+        if ($answer[0] === $status) {
+            $this->addToAssertionCount(1);
+
+            return;
+        }
+        usleep(500_000); // the app sends what it captured once it has answered
+        $reported = [];
+        foreach (array_filter(explode("\n", (string) file_get_contents($this->ingest))) as $line) {
+            foreach (json_decode($line, true)['body']['resourceLogs'] ?? [] as $rl) {
+                foreach ($rl['scopeLogs'] as $sl) {
+                    foreach ($sl['logRecords'] as $rec) {
+                        $a = array_column($rec['attributes'], 'value', 'key');
+                        $reported[] = ($a['exception.type']['stringValue'] ?? 'message') . ': ' . ($a['exception.message']['stringValue'] ?? '');
+                    }
+                }
+            }
+        }
+        self::fail("answered {$answer[0]}, not {$status}: " . substr($answer[1], 0, 500) . "\nreported: " . implode("\n          ", $reported));
     }
 
     /**
