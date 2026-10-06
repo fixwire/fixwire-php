@@ -8,9 +8,10 @@ use Fixwire\Internal\Redaction\Redactor;
 use PHPUnit\Framework\TestCase;
 
 /**
- * The shared corpus of the Fixwire server's redaction
- * (pkg/redact/testdata/vectors.json): the same defaults, the same masked
- * strings and findings, the same masked documents and counts.
+ * The shared corpus of the Fixwire server's redaction (a copy of
+ * pkg/redact/testdata/vectors.json in fixwire/fixwire, kept identical): the
+ * same defaults, the same masked strings and findings, the same masked
+ * documents and counts.
  */
 final class VectorsTest extends TestCase
 {
@@ -51,11 +52,7 @@ final class VectorsTest extends TestCase
     private static function vectors(): \stdClass
     {
         if (self::$vectors === null) {
-            $path = self::path();
-            if ($path === null) {
-                self::markTestSkipped('pkg/redact/testdata/vectors.json not found (set FIXWIRE_VECTORS)');
-            }
-            $json = file_get_contents($path);
+            $json = file_get_contents(__DIR__ . '/vectors.json');
             self::assertIsString($json);
             // Objects stay \stdClass, so an empty object is not a list.
             $v = json_decode($json, false, 512, JSON_THROW_ON_ERROR);
@@ -64,24 +61,6 @@ final class VectorsTest extends TestCase
         }
 
         return self::$vectors;
-    }
-
-    /** The corpus, found by walking up from here, else at FIXWIRE_VECTORS. */
-    private static function path(): ?string
-    {
-        for ($dir = __DIR__; ; $dir = $parent) {
-            $candidate = $dir . '/pkg/redact/testdata/vectors.json';
-            if (is_file($candidate)) {
-                return $candidate;
-            }
-            $parent = \dirname($dir);
-            if ($parent === $dir) {
-                break;
-            }
-        }
-        $env = getenv('FIXWIRE_VECTORS');
-
-        return \is_string($env) && $env !== '' && is_file($env) ? $env : null;
     }
 
     /**
