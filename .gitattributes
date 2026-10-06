@@ -1,5 +1,8 @@
 # Left out of the package Composer installs.
 /.gitattributes export-ignore
+/.github export-ignore
+/CONTRIBUTING.md export-ignore
+/SECURITY.md export-ignore
 /.gitignore export-ignore
 /.php-cs-fixer.dist.php export-ignore
 /examples export-ignore

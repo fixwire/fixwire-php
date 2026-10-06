@@ -1,5 +1,7 @@
 # Fixwire for PHP
 
+[![CI](https://github.com/fixwire/fixwire-php/actions/workflows/ci.yml/badge.svg)](https://github.com/fixwire/fixwire-php/actions/workflows/ci.yml)
+
 The Fixwire SDK for PHP 8.1+: errors with their previous exceptions, fatal
 errors, traces, release health, cron monitors and feedback. It needs only
 `ext-json` and `ext-mbstring`; it sends with curl when it is there, else
