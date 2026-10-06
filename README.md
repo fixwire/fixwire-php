@@ -78,6 +78,9 @@ Fixwire\withScope(function (Fixwire\Scope $scope) use ($account) {
 
 Laravel apps install [`fixwire/laravel`](https://github.com/fixwire/fixwire-laravel) instead: it sets all of
 this up from `config/fixwire.php`, with queue jobs and scheduled tasks.
+Symfony apps install [`fixwire/symfony`](https://github.com/fixwire/fixwire-symfony): the same from
+`config/packages/fixwire.yaml`, with Messenger, Doctrine and the HTTP
+client.
 
 | | |
 |---|---|
