@@ -43,6 +43,8 @@ final class Handler extends AbstractProcessingHandler
         self::$writing = true;
         try {
             $this->send($hub, $client, $record);
+        } catch (\Throwable $e) {
+            $client->log('sending a log record failed: ' . $e->getMessage()); // never into the app's logging
         } finally {
             self::$writing = false;
         }

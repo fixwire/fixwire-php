@@ -149,7 +149,7 @@ ends. A negative score opens a `user_feedback` issue for the agent run.
 | `server_name` | the host name | |
 | `sample_rate` | 1 | Share of errors sent |
 | `traces_sample_rate` | 0 | Share of new traces kept |
-| `trace_propagation_targets` | none | URLs that receive trace headers |
+| `trace_propagation_targets` | none | Where trace headers go: a URL prefix (`https://api.example.com/v2`), or a host (with a port if it has one) and its subdomains (`example.com` matches `api.example.com`, not `badexample.com`). URLs are compared without user info, query and fragment |
 | `before_send`, `before_breadcrumb` | | Change or drop events and breadcrumbs |
 | `send_default_pii` | off | Send the user's IP address and identifying headers |
 | `redact`, `sensitive_keys` | on, the server's keys | On-device masking |
@@ -161,8 +161,10 @@ ends. A negative score opens a `user_feedback` issue for the agent run.
 | `project_root` | the Composer project's root | Files are named relative to it |
 | `in_app_include`, `in_app_exclude` | | Class prefixes that are, or are not, your code |
 | `context_lines` | 5 | Source lines around each of your frames |
+| `max_stack_frames` | 100 | Frames per exception, the newest kept |
+| `max_value_length` | 1024 | Bytes of UTF-8 per string sent; longer ones are cut, ending in `...` |
 | `max_breadcrumbs`, `max_queue` | 100, 100 | |
-| `timeout` | 2 s | Of each request to Fixwire |
+| `timeout` | 2 s | How long a flush may take (at exit, the request waits for it) |
 
 An option that doesn't exist is an error, so a typo doesn't go unnoticed.
 

@@ -90,7 +90,9 @@ final class Redactor
 
     /**
      * Masks the findings in s: each becomes "[REDACTED:<detector>]", as the
-     * server writes it. Text without findings comes back unchanged.
+     * server writes it. Text without findings comes back unchanged; text a
+     * detector fails on (PCRE's limits) comes back as "[Filtered]", never
+     * unmasked.
      *
      * @return array{0: string, 1: list<string>} the masked text ("[REDACTED:<detector>]" exactly as the server) and each finding's detector
      */
@@ -100,7 +102,11 @@ final class Redactor
             return [$s, []];
         }
         $t = new Text(Text::scrub($s));
-        [$starts, $ends, $names] = $this->find($t);
+        $found = $this->find($t);
+        if (\is_string($found)) {
+            return [self::FILTERED, [$found]];
+        }
+        [$starts, $ends, $names] = $found;
         if ($starts === []) {
             return [$s, []];
         }
@@ -140,11 +146,11 @@ final class Redactor
     /**
      * The non-overlapping findings in t, leftmost first; when two overlap,
      * the earlier detector wins. A detector whose pattern fails (PCRE's
-     * limits) masks the whole text, so a failure never lets a value through.
+     * limits) gives its name instead, so a failure never lets a value through.
      *
-     * @return array{list<int>, list<int>, list<string>} the start, end and detector of each
+     * @return array{list<int>, list<int>, list<string>}|string the start, end and detector of each, or the detector that failed
      */
-    private function find(Text $t): array
+    private function find(Text $t): array|string
     {
         // The findings so far, sorted by start and disjoint.
         $starts = [];
@@ -156,7 +162,7 @@ final class Redactor
             }
             $spans = $d->spans($t);
             if ($spans === null) {
-                return [[0], [\strlen($t->s)], [$d->name]];
+                return $d->name;
             }
             $addStarts = [];
             $addEnds = [];
@@ -349,15 +355,18 @@ final class Redactor
         // Keys hold data too ({"ada@example.com": 3}). Keys that mask alike
         // are numbered in code-point order (byte order of UTF-8), each
         // taking the first name no key holds at its turn:
-        // "[REDACTED:email] (2)".
+        // "[REDACTED:email] (2)". The numbers a masked key tried are not
+        // tried again, so many keys that mask alike take linear time.
         usort($renamed, static fn(array $a, array $b): int => strcmp($a[0], $b[0]));
         $taken = array_fill_keys(array_keys($out), true);
         $names = [];
+        $next = []; // masked key => the number to try next
         foreach ($renamed as [, $k, $masked, $count]) {
             $key = $masked;
-            for ($i = 2; isset($taken[$key]); $i++) {
+            for ($i = max($next[$masked] ?? 2, 2); isset($taken[$key]); $i++) {
                 $key = $masked . ' (' . $i . ')';
             }
+            $next[$masked] = $i;
             unset($taken[$k]);
             $taken[$key] = true;
             $names[$k] = $key;

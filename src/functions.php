@@ -205,8 +205,11 @@ function captureFeedback(Feedback $feedback): ?string
     return Hub::current()->captureFeedback($feedback);
 }
 
-/** Sends what was captured now (workers: after each job); false when something could not be sent. */
-function flush(): bool
+/**
+ * Sends what was captured now (workers: after each job), within $timeout seconds (the timeout
+ * option when null); false when something could not be sent.
+ */
+function flush(?float $timeout = null): bool
 {
-    return Hub::current()->flush();
+    return Hub::current()->flush($timeout);
 }

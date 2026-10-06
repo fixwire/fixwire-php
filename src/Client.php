@@ -25,14 +25,29 @@ final class Client
     private const CHECK_IN = 'check_in';
     private const FEEDBACK = 'feedback';
 
+    /** The categories a rate limit may name (sdks/PROTOCOL.md §2); others are ignored. */
+    private const CATEGORIES = ['error', 'log', 'span', 'session', 'check_in', 'feedback', 'file'];
+
     /** The log records and spans per request to Fixwire. */
     private const BATCH = 100;
 
-    /** The bytes of log records or spans per request: under the protocol's 5 MB. */
-    private const BATCH_BYTES = 4 * 1024 * 1024;
+    /** The bytes of a request of log records or spans, all of its JSON. */
+    private const BATCH_BYTES = 5 * 1024 * 1024;
 
-    /** The longest pause an answer can ask for, in seconds (as long as APCu keeps it). */
-    private const MAX_PAUSE = 3600;
+    /** The bytes of JSON an error or a message may take. */
+    private const MAX_RECORD = 1024 * 1024;
+
+    /** The longest pause an answer can ask for, in seconds: a day. */
+    private const MAX_PAUSE = 86_400;
+
+    /** The pause a 429 without Fixwire-Rate-Limits asks for at least, in seconds. */
+    private const MIN_429_PAUSE = 60;
+
+    /** The wait before the one retry of a request, in seconds (more tries would hold up the exit). */
+    private const BACKOFF = 1.0;
+
+    /** Where PHP-FPM workers share their pauses. */
+    private const SHARED_PAUSES = 'fixwire.rate_limits';
 
     /** How bodies are encoded (and batches measured). */
     private const JSON = \JSON_UNESCAPED_SLASHES | \JSON_UNESCAPED_UNICODE | \JSON_INVALID_UTF8_SUBSTITUTE | \JSON_PRESERVE_ZERO_FRACTION | \JSON_PARTIAL_OUTPUT_ON_ERROR;
@@ -64,6 +79,9 @@ final class Client
     /** Whether a request of this flush got no answer: the rest are dropped, not each waiting as long. */
     private bool $unreachable = false;
 
+    /** The process whose data is queued: a child of pcntl_fork() leaves it to its parent. */
+    private int $pid;
+
     /** @var array<string, float> category ("" for all) → paused until, within this process */
     private static array $paused = [];
 
@@ -80,6 +98,18 @@ final class Client
         $this->dsn = Options::empty($options->dsn) ? null : Dsn::parse((string) $options->dsn);
         $this->sessions = $this->dsn !== null && $options->sessionsOn() ? new Sessions() : null;
         $this->captured = new \WeakMap();
+        $this->pid = (int) getmypid();
+    }
+
+    /** In a forked child, forgets what the parent queued: the parent sends it. */
+    private function ownQueue(): void
+    {
+        $pid = (int) getmypid();
+        if ($pid !== $this->pid) {
+            $this->pid = $pid;
+            $this->records = $this->spans = $this->requests = [];
+            $this->sessions?->take($this->options);
+        }
     }
 
     /** Whether the client sends: false without a DSN. */
@@ -106,16 +136,59 @@ final class Client
         return $this->budget;
     }
 
-    /** Whether trace headers may go to a URL: it holds one of the trace propagation targets. */
+    /**
+     * Whether trace headers may go to a URL: one of the trace propagation targets matches it,
+     * compared without its user info, query and fragment (see Options::$tracePropagationTargets).
+     */
     public function shouldPropagate(string $url): bool
     {
+        $u = parse_url($url);
+        if (!\is_array($u) || !isset($u['scheme'], $u['host']) || str_contains($u['host'], '\\')) {
+            return false; // a relative URL, or one HTTP clients may read differently
+        }
+        $scheme = strtolower($u['scheme']);
+        $host = strtolower($u['host']);
+        $port = $u['port'] ?? ($scheme === 'https' ? 443 : ($scheme === 'http' ? 80 : null));
+        $compared = $scheme . '://' . $host . (isset($u['port']) ? ':' . $u['port'] : '') . ($u['path'] ?? '');
         foreach ($this->options->tracePropagationTargets as $target) {
-            if ($target !== '' && str_contains($url, $target)) {
+            if ($target === '' || $target[0] === '/') {
+                continue; // a path on a browser page's origin: nothing here
+            }
+            if (str_contains($target, '://')) {
+                // The scheme and host in any case, the path as it is.
+                $slash = strpos($target, '/', strpos($target, '://') + 3);
+                $prefix = $slash === false ? strtolower($target) : strtolower(substr($target, 0, $slash)) . substr($target, $slash);
+                if (str_starts_with($compared, $prefix)) {
+                    return true;
+                }
+                continue;
+            }
+            [$targetHost, $targetPort] = self::hostAndPort(strtolower($target));
+            if (($host === $targetHost || str_ends_with($host, '.' . $targetHost)) && ($targetPort === null || $targetPort === $port)) {
                 return true;
             }
         }
 
         return false;
+    }
+
+    /**
+     * A host target's host and port: example.com, example.com:8443, [::1]:8080.
+     *
+     * @return array{0: string, 1: ?int}
+     */
+    private static function hostAndPort(string $target): array
+    {
+        $colon = strrpos($target, ':');
+        if ($colon === false || !ctype_digit(substr($target, $colon + 1))) {
+            return [$target, null];
+        }
+        $host = substr($target, 0, $colon);
+        if (str_contains($host, ':') && !str_ends_with($host, ']')) {
+            return [$target, null]; // an IPv6 address without brackets: no port
+        }
+
+        return [$host, (int) substr($target, $colon + 1)];
     }
 
     /** Whether a throwable was captured already, so that a log record of it is not sent twice. */
@@ -194,9 +267,40 @@ final class Client
         if (!$this->room()) {
             return null;
         }
-        $this->records[] = Otlp::eventRecord($e, $this->redactor);
+        $record = self::fit(Otlp::eventRecord($e, $this->redactor, $this->options->maxValueLength));
+        if ($record === null) {
+            $this->log('dropped an event: over 1 MB without its breadcrumbs and contexts');
+
+            return null;
+        }
+        $this->records[] = $record;
 
         return $e->eventId;
+    }
+
+    /**
+     * An error or a message within MAX_RECORD bytes of JSON: without its breadcrumbs, then without
+     * its contexts, if need be (PHP's frames carry no local variables); null when still over.
+     *
+     * @param array<string, mixed> $record
+     *
+     * @return array<string, mixed>|null
+     */
+    private static function fit(array $record): ?array
+    {
+        foreach ([null, 'fixwire.breadcrumbs', 'fixwire.contexts'] as $shed) {
+            if ($shed !== null && \is_array($record['attributes'] ?? null)) {
+                $record['attributes'] = array_values(array_filter(
+                    $record['attributes'],
+                    static fn(mixed $kv): bool => !\is_array($kv) || ($kv['key'] ?? null) !== $shed,
+                ));
+            }
+            if (\strlen((string) json_encode($record, self::JSON)) <= self::MAX_RECORD) {
+                return $record;
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -211,7 +315,7 @@ final class Client
                 return;
             }
             try {
-                $this->spans[] = Otlp::span($span->record(), $this->redactor);
+                $this->spans[] = Otlp::span($span->record(), $this->redactor, $this->options->maxValueLength);
             } catch (\Throwable $ex) {
                 $this->log('recording a span failed: ' . $ex->getMessage());
             }
@@ -252,7 +356,9 @@ final class Client
             $body['monitor_config'] = $checkIn->config->toWire();
         }
 
-        return $this->post('/v1/check-ins/' . rawurlencode($checkIn->monitor), self::CHECK_IN, $body) ? $id : null;
+        $deadline = microtime(true) + $this->options->timeout;
+
+        return $this->post('/v1/check-ins/' . rawurlencode($checkIn->monitor), self::CHECK_IN, $body, $deadline) ? $id : null;
     }
 
     /** @internal queues feedback: its id, or null when not sent (never throws) */
@@ -285,7 +391,7 @@ final class Client
         if ($score != 0) {
             $body['score'] = $score;
         }
-        $body = Otlp::scrub($body, $this->redactor);
+        $body = Otlp::fields($body, $this->redactor, $this->options->maxValueLength);
         $id = Ids::new(16);
         $body += array_filter([
             'sdk' => self::sdk(),
@@ -303,31 +409,43 @@ final class Client
     }
 
     /**
-     * Sends what was captured; false when something could not be sent.
+     * Sends what was captured, within $timeout seconds (the timeout option when null); false when
+     * something could not be sent. Never throws.
      */
-    public function flush(): bool
+    public function flush(?float $timeout = null): bool
     {
         if ($this->dsn === null) {
             return true;
         }
+        try {
+            return $this->doFlush(microtime(true) + ($timeout ?? $this->options->timeout));
+        } catch (\Throwable $ex) {
+            $this->log('flushing failed: ' . $ex->getMessage());
+
+            return false;
+        }
+    }
+
+    private function doFlush(float $deadline): bool
+    {
+        $this->ownQueue();
         $ok = true;
         $this->unreachable = false;
-        $session = $this->sessions?->take($this->options);
-        if ($session !== null) {
+        foreach ($this->sessions?->take($this->options) ?? [] as $session) {
             $this->requests[] = ['/v1/sessions', self::SESSION, $session];
         }
         $records = $this->records;
         $spans = $this->spans;
         $requests = $this->requests;
         $this->records = $this->spans = $this->requests = [];
-        foreach (self::batches($records) as $batch) {
-            $ok = $this->send('/v1/logs', self::ERROR, fn(): array => Otlp::logs($this->options, $batch)) && $ok;
+        foreach ($this->batches($records, Otlp::logs($this->options, [])) as $batch) {
+            $ok = $this->send('/v1/logs', self::ERROR, fn(): array => Otlp::logs($this->options, $batch), $deadline) && $ok;
         }
-        foreach (self::batches($spans) as $batch) {
-            $ok = $this->send('/v1/traces', self::SPAN, fn(): array => Otlp::traces($this->options, $batch)) && $ok;
+        foreach ($this->batches($spans, Otlp::traces($this->options, [])) as $batch) {
+            $ok = $this->send('/v1/traces', self::SPAN, fn(): array => Otlp::traces($this->options, $batch), $deadline) && $ok;
         }
         foreach ($requests as [$path, $category, $body]) {
-            $ok = $this->send($path, $category, static fn(): array => $body) && $ok;
+            $ok = $this->send($path, $category, static fn(): array => $body, $deadline) && $ok;
         }
 
         return $ok;
@@ -338,7 +456,7 @@ final class Client
      *
      * @param \Closure(): array<string, mixed> $body
      */
-    private function send(string $path, string $category, \Closure $body): bool
+    private function send(string $path, string $category, \Closure $body, float $deadline): bool
     {
         if ($this->unreachable) {
             $this->log("dropping a {$category} request: Fixwire did not answer");
@@ -346,7 +464,7 @@ final class Client
             return false;
         }
         try {
-            return $this->post($path, $category, $body());
+            return $this->post($path, $category, $body(), $deadline);
         } catch (\Throwable $ex) {
             $this->log("sending to {$path} failed: " . $ex->getMessage());
 
@@ -356,6 +474,7 @@ final class Client
 
     private function room(): bool
     {
+        $this->ownQueue();
         if (\count($this->records) + \count($this->spans) + \count($this->requests) >= $this->options->maxQueue) {
             $this->log('dropping: the queue is full');
 
@@ -366,21 +485,28 @@ final class Client
     }
 
     /**
-     * Log records or spans in requests of at most BATCH of them and BATCH_BYTES of JSON (each
-     * measured once), so that one request too large for Fixwire doesn't lose the rest.
+     * Log records or spans in requests of at most BATCH of them and BATCH_BYTES of JSON, the
+     * export around them included (each measured once), so that one request too large for Fixwire
+     * doesn't lose the rest. An item that can't fit in a request of its own is dropped alone.
      *
      * @param list<array<string, mixed>> $items
+     * @param array<string, mixed>       $empty the export without items
      *
      * @return list<list<array<string, mixed>>>
      */
-    private static function batches(array $items): array
+    private function batches(array $items, array $empty): array
     {
+        $room = self::BATCH_BYTES - \strlen((string) json_encode($empty, self::JSON));
         $batches = [];
         $batch = [];
         $bytes = 0;
         foreach ($items as $item) {
-            $size = \strlen((string) json_encode($item, self::JSON));
-            if ($batch !== [] && (\count($batch) === self::BATCH || $bytes + $size > self::BATCH_BYTES)) {
+            $size = \strlen((string) json_encode($item, self::JSON)) + 1; // and a comma
+            if ($size > $room) {
+                $this->log('dropped a record or span: over 5 MB alone');
+                continue;
+            }
+            if ($batch !== [] && (\count($batch) === self::BATCH || $bytes + $size > $room)) {
                 $batches[] = $batch;
                 $batch = [];
                 $bytes = 0;
@@ -396,12 +522,13 @@ final class Client
     }
 
     /**
-     * Sends one request now, honouring rate limits; one retry when there was no answer or a 5xx
-     * (unless it said when to come back).
+     * Sends one request now, by $deadline, honouring rate limits. A request without an answer, or
+     * with a 5xx, is tried once more BACKOFF later (unless the answer paused it, or that would pass
+     * the deadline): PHP sends at exit, where more tries would hold the app up.
      *
      * @param array<string, mixed> $body
      */
-    private function post(string $path, string $category, array $body): bool
+    private function post(string $path, string $category, array $body, float $deadline): bool
     {
         if ($this->dsn === null || $this->paused($category)) {
             $this->log("dropping a {$category} request: paused");
@@ -423,8 +550,17 @@ final class Client
             $json = (string) gzencode($json, 1);
             $headers['Content-Encoding'] = 'gzip';
         }
-        for ($attempt = 0; $attempt < 2; $attempt++) {
-            [$status, $answer] = $this->transport->send($this->dsn->url($path), $json, $headers);
+        $url = $this->dsn->url($path);
+        for ($attempt = 0; ; $attempt++) {
+            $left = $deadline - microtime(true);
+            if ($left <= 0.001) {
+                $this->log("dropping a {$category} request: out of time");
+
+                return false;
+            }
+            [$status, $answer] = $this->transport instanceof HttpTransport
+                ? $this->transport->sendWithin($url, $json, $headers, $left)
+                : $this->transport->send($url, $json, $headers);
             $this->limit($answer['fixwire-rate-limits'] ?? null, $status, $answer['retry-after'] ?? null);
             if ($status >= 200 && $status < 300) {
                 return true;
@@ -434,9 +570,11 @@ final class Client
 
                 return false;
             }
-            if ($this->paused($category)) {
-                break; // a 503 with Retry-After: not before then
+            // A 503 with Retry-After: not before then.
+            if ($attempt === 1 || $this->paused($category) || microtime(true) + self::BACKOFF >= $deadline) {
+                break;
             }
+            usleep((int) (self::BACKOFF * 1e6));
         }
         $this->unreachable = $status === 0;
         $this->log("dropping a {$category} request ({$status}" . (isset($answer['error']) ? ': ' . $answer['error'] : '') . ')');
@@ -447,46 +585,117 @@ final class Client
     private function paused(string $category): bool
     {
         $now = microtime(true);
-        $stored = \function_exists('apcu_fetch') && \function_exists('apcu_enabled') && apcu_enabled() ? apcu_fetch('fixwire.rate_limits') : false;
-        $paused = \is_array($stored) ? $stored + self::$paused : self::$paused;
+        foreach ([self::$paused, self::sharedPauses()] as $paused) {
+            if (($paused[$category] ?? 0) > $now || ($paused[''] ?? 0) > $now) {
+                return true;
+            }
+        }
 
-        return ($paused[$category] ?? 0) > $now || ($paused[''] ?? 0) > $now;
+        return false;
     }
 
     /**
-     * Reads Fixwire-Rate-Limits ("<seconds>:<category;…>, …"; no categories means all), a bare 429,
-     * and a 5xx's Retry-After (seconds; an HTTP date counts as none). Pauses are at most MAX_PAUSE.
+     * The pauses the PHP-FPM workers of this server share through APCu.
+     *
+     * @return array<string, float> category ("" for all) → paused until
+     */
+    private static function sharedPauses(): array
+    {
+        if (!\function_exists('apcu_fetch') || !\function_exists('apcu_enabled') || !apcu_enabled()) {
+            return [];
+        }
+        $stored = apcu_fetch(self::SHARED_PAUSES);
+        $out = [];
+        foreach (\is_array($stored) ? $stored : [] as $category => $until) {
+            if (\is_string($category) && (\is_float($until) || \is_int($until))) {
+                $out[$category] = (float) $until;
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * Reads Fixwire-Rate-Limits ("<seconds>:<category;…>, …"; no categories means all; categories
+     * Fixwire doesn't name are ignored), a 429 without it (Retry-After, at least MIN_429_PAUSE, for
+     * all) and a 5xx's Retry-After (for all). Seconds count up to MAX_PAUSE; broken ones are
+     * ignored.
      */
     private function limit(?string $header, int $status, ?string $retryAfter): void
     {
         $now = microtime(true);
-        $changed = false;
-        if ($header === null && $status === 429) {
-            $header = max((int) $retryAfter, 60) . ':';
-        } elseif ($header === null && $status >= 500 && (int) $retryAfter > 0) {
-            $header = (int) $retryAfter . ':';
-        }
+        $pauses = []; // category ("" for all) → seconds
         foreach ($header === null ? [] : explode(',', $header) as $part) {
             $sc = explode(':', trim($part), 2);
-            $secs = min((int) $sc[0], self::MAX_PAUSE);
-            if ($secs <= 0) {
+            $secs = self::seconds($sc[0]);
+            if ($secs === null || $secs === 0) {
                 continue;
             }
             $cats = trim($sc[1] ?? '');
-            foreach ($cats === '' ? [''] : explode(';', $cats) as $cat) {
-                self::$paused[trim($cat)] = max(self::$paused[trim($cat)] ?? 0, $now + $secs);
-                $changed = true;
+            foreach ($cats === '' ? [''] : array_intersect(array_map('trim', explode(';', $cats)), self::CATEGORIES) as $cat) {
+                $pauses[$cat] = max($pauses[$cat] ?? 0, $secs);
             }
         }
-        if ($changed && \function_exists('apcu_store') && \function_exists('apcu_enabled') && apcu_enabled()) {
-            apcu_store('fixwire.rate_limits', self::$paused, 3600); // shared with the other requests of this server
+        $after = $retryAfter === null ? null : self::retryAfter($retryAfter, $now);
+        if ($header === null && $status === 429) {
+            $pauses[''] = max($after ?? 0, self::MIN_429_PAUSE);
+        } elseif ($status >= 500 && $after !== null && $after > 0) {
+            $pauses[''] = max($pauses[''] ?? 0, $after);
         }
+        if ($pauses === []) {
+            return;
+        }
+        foreach ($pauses as $cat => $secs) {
+            self::$paused[$cat] = max(self::$paused[$cat] ?? 0, $now + $secs);
+        }
+        if (\function_exists('apcu_store') && \function_exists('apcu_enabled') && apcu_enabled()) {
+            // Shared with the other requests of this server, whose pauses of other categories stay.
+            $shared = self::sharedPauses();
+            foreach (self::$paused as $cat => $until) {
+                $shared[$cat] = max($shared[$cat] ?? 0, $until);
+            }
+            $shared = array_filter($shared, static fn(float $until): bool => $until > $now);
+            if ($shared !== []) {
+                apcu_store(self::SHARED_PAUSES, $shared, (int) ceil(max($shared) - $now));
+            }
+        }
+    }
+
+    /** Whole seconds of a header, up to MAX_PAUSE; null when broken. */
+    private static function seconds(string $s): ?int
+    {
+        $s = trim($s);
+        if ($s === '' || !ctype_digit($s)) {
+            return null;
+        }
+
+        return \strlen($s) > 6 ? self::MAX_PAUSE : min((int) $s, self::MAX_PAUSE);
+    }
+
+    /** Retry-After's seconds (a number, or an HTTP date from now), up to MAX_PAUSE; null when broken. */
+    private static function retryAfter(string $value, float $now): ?int
+    {
+        $secs = self::seconds($value);
+        if ($secs !== null) {
+            return $secs;
+        }
+        // IMF-fixdate (Sun, 06 Nov 1994 08:49:37 GMT), as HTTP servers write it.
+        $date = \DateTimeImmutable::createFromFormat('D, d M Y H:i:s \G\M\T', trim($value), new \DateTimeZone('UTC'));
+        $errors = \DateTimeImmutable::getLastErrors();
+        if ($date === false || ($errors !== false && ($errors['warning_count'] > 0 || $errors['error_count'] > 0))) {
+            return null;
+        }
+
+        return (int) min(max(0, ceil($date->getTimestamp() - $now)), self::MAX_PAUSE);
     }
 
     /** @internal forgets the rate limits (tests) */
     public static function resetRateLimits(): void
     {
         self::$paused = [];
+        if (\function_exists('apcu_delete') && \function_exists('apcu_enabled') && apcu_enabled()) {
+            apcu_delete(self::SHARED_PAUSES);
+        }
     }
 
     /**

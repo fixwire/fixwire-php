@@ -107,6 +107,18 @@ final class ProcessTest extends TestCase
         self::assertSame(0, $code, $out);
     }
 
+    /** @param list<string> $php */
+    #[DataProvider('transports')]
+    public function testExitsWithinTheShutdownTimeout(array $php): void
+    {
+        $port = $this->serve(__DIR__ . '/fixtures/slow.php', []);
+        $start = microtime(true);
+        [$code, $out] = $this->script('message', $php, "http://publickey@127.0.0.1:{$port}");
+        self::assertSame(0, $code, $out);
+        // The default 2 s, not a retry on top: PHP's startup and the scheduler get the rest.
+        self::assertLessThan(3.5, microtime(true) - $start);
+    }
+
     public function testTracksTheWebRequestPhpServes(): void
     {
         $port = $this->serve(__DIR__ . '/fixtures/web.php', ['FIXWIRE_DSN' => $this->dsn]);

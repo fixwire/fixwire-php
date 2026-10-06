@@ -244,9 +244,9 @@ final class Hub
         };
     }
 
-    /** Sends what was captured; false when something could not be sent. */
-    public function flush(): bool
+    /** Sends what was captured, within $timeout seconds (the timeout option when null); false when something could not be sent. */
+    public function flush(?float $timeout = null): bool
     {
-        return $this->client?->flush() ?? true;
+        return $this->client?->flush($timeout) ?? true;
     }
 }

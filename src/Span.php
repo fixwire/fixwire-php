@@ -18,8 +18,12 @@ final class Span
     /** The spans a segment keeps until it is sent. */
     public const MAX_CHILDREN = 1000;
 
-    /** The longest tracestate or baggage passed on, in bytes: W3C's limit for baggage. */
-    private const MAX_HEADER = 8192;
+    /** The attributes a span keeps: the first set. */
+    public const MAX_ATTRIBUTES = 128;
+
+    /** The longest tracestate and baggage passed on, in bytes: W3C's limits. */
+    private const MAX_TRACESTATE = 512;
+    private const MAX_BAGGAGE = 8192;
 
     public readonly string $traceId;
 
@@ -71,12 +75,15 @@ final class Span
     ) {
         $this->spanId = Ids::new(8);
         $this->start = $startTime ?? microtime(true);
+        if (\count($this->attributes) > self::MAX_ATTRIBUTES) {
+            $this->attributes = \array_slice($this->attributes, 0, self::MAX_ATTRIBUTES, true);
+        }
         $continued = $traceparent === null ? null : self::parseTraceparent($traceparent);
         if ($continued !== null) {
             [$this->traceId, $this->parentSpanId, $this->sampled] = $continued;
             $this->remoteParent = true;
-            $this->tracestate = self::passOn($tracestate);
-            $this->baggage = self::passOn($baggage);
+            $this->tracestate = self::passOn($tracestate, self::MAX_TRACESTATE);
+            $this->baggage = self::passOn($baggage, self::MAX_BAGGAGE);
             $this->segment = $this;
         } elseif ($parent !== null) {
             $this->traceId = $parent->traceId;
@@ -151,7 +158,8 @@ final class Span
     }
 
     /**
-     * Reads 00-<trace id>-<parent id>-<flags>; null when malformed.
+     * Reads 00-<trace id>-<parent id>-<flags>: version 00, a non-zero 32-hex trace id, a non-zero
+     * 16-hex parent id and 2-hex flags; null otherwise.
      *
      * @internal
      *
@@ -160,10 +168,10 @@ final class Span
     public static function parseTraceparent(string $header): ?array
     {
         $p = explode('-', trim($header));
-        if (\count($p) < 4 || \strlen($p[0]) !== 2 || strtolower($p[0]) === 'ff' || \strlen($p[1]) !== 32 || \strlen($p[2]) !== 16 || \strlen($p[3]) !== 2) {
+        if (\count($p) !== 4 || $p[0] !== '00' || \strlen($p[1]) !== 32 || \strlen($p[2]) !== 16 || \strlen($p[3]) !== 2) {
             return null;
         }
-        if (!ctype_xdigit($p[0] . $p[1] . $p[2] . $p[3]) || trim($p[1], '0') === '' || trim($p[2], '0') === '') {
+        if (!ctype_xdigit($p[1] . $p[2] . $p[3]) || trim($p[1], '0') === '' || trim($p[2], '0') === '') {
             return null;
         }
 
@@ -171,12 +179,13 @@ final class Span
     }
 
     /**
-     * A caller's tracestate or baggage, to pass on as it came; null when it is too long, or holds
-     * what would end a header (it may come from a queue's payload rather than a header).
+     * A caller's tracestate or baggage, to pass on as it came; null when it is longer than $limit
+     * bytes, or holds a control character, which could end a header (it may come from a queue's
+     * payload rather than a header). Tabs are spaces in these lists.
      */
-    private static function passOn(?string $header): ?string
+    private static function passOn(?string $header, int $limit): ?string
     {
-        return $header === null || \strlen($header) > self::MAX_HEADER || strpbrk($header, "\r\n\0") !== false ? null : $header;
+        return $header === null || \strlen($header) > $limit || preg_match('/[\x00-\x08\x0A-\x1F\x7F]/', $header) === 1 ? null : $header;
     }
 
     /** The W3C traceparent header that continues this span's trace in a service it calls. */
@@ -185,9 +194,12 @@ final class Span
         return '00-' . $this->traceId . '-' . $this->spanId . ($this->sampled ? '-01' : '-00');
     }
 
+    /** Sets an attribute; past MAX_ATTRIBUTES, new ones are left out. */
     public function setAttribute(string $key, mixed $value): self
     {
-        $this->attributes[$key] = $value;
+        if (\count($this->attributes) < self::MAX_ATTRIBUTES || \array_key_exists($key, $this->attributes)) {
+            $this->attributes[$key] = $value;
+        }
 
         return $this;
     }
@@ -198,7 +210,7 @@ final class Span
         $this->failed = true;
         if ($error instanceof \Throwable) {
             $this->statusMessage = $error->getMessage();
-            $this->attributes['error.type'] = $error::class;
+            $this->setAttribute('error.type', $error::class);
         } elseif ($error !== null) {
             $this->statusMessage = $error;
         }
@@ -259,7 +271,11 @@ final class Span
         $m['kind'] = $this->kind->value;
         $m['startTimeUnixNano'] = self::nanos($this->start);
         $m['endTimeUnixNano'] = self::nanos($this->end ?? microtime(true));
-        $m['attributes'] = $this->attributes + ['fixwire.op' => $this->op];
+        $attributes = $this->attributes;
+        if ($this->op !== null && \count($attributes) >= self::MAX_ATTRIBUTES && !isset($attributes['fixwire.op'])) {
+            $attributes = \array_slice($attributes, 0, self::MAX_ATTRIBUTES - 1, true); // the op is one of them
+        }
+        $m['attributes'] = $attributes + ['fixwire.op' => $this->op];
         $status = ['code' => $this->failed ? 2 : 1];
         if ($this->failed && $this->statusMessage !== null) {
             $status['message'] = $this->statusMessage;

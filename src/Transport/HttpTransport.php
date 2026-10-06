@@ -17,7 +17,21 @@ final class HttpTransport implements Transport
 
     public function send(string $url, string $body, array $headers): array
     {
-        return \function_exists('curl_init') ? $this->curl($url, $body, $headers) : $this->stream($url, $body, $headers);
+        return $this->sendWithin($url, $body, $headers, $this->timeout);
+    }
+
+    /**
+     * @internal sends within $timeout seconds (what is left of a flush)
+     *
+     * @param array<string, string> $headers
+     *
+     * @return array{0: int, 1: array<string, string>}
+     */
+    public function sendWithin(string $url, string $body, array $headers, float $timeout): array
+    {
+        $timeout = max(0.001, min($timeout, $this->timeout));
+
+        return \function_exists('curl_init') ? $this->curl($url, $body, $headers, $timeout) : $this->stream($url, $body, $headers, $timeout);
     }
 
     /**
@@ -25,7 +39,7 @@ final class HttpTransport implements Transport
      *
      * @return array{0: int, 1: array<string, string>}
      */
-    private function curl(string $url, string $body, array $headers): array
+    private function curl(string $url, string $body, array $headers, float $timeout): array
     {
         $answer = [];
         $read = 0;
@@ -43,8 +57,8 @@ final class HttpTransport implements Transport
 
                 return $read > self::MAX_BODY ? 0 : \strlen($data);
             },
-            \CURLOPT_TIMEOUT_MS => (int) ($this->timeout * 1000),
-            \CURLOPT_CONNECTTIMEOUT_MS => (int) min($this->timeout * 1000, 1000),
+            \CURLOPT_TIMEOUT_MS => max(1, (int) ($timeout * 1000)), // 0 would be none
+            \CURLOPT_CONNECTTIMEOUT_MS => max(1, (int) min($timeout * 1000, 1000)),
             \CURLOPT_HEADERFUNCTION => static function ($c, string $line) use (&$answer): int {
                 $parts = explode(':', $line, 2);
                 if (\count($parts) === 2) {
@@ -67,13 +81,13 @@ final class HttpTransport implements Transport
      *
      * @return array{0: int, 1: array<string, string>}
      */
-    private function stream(string $url, string $body, array $headers): array
+    private function stream(string $url, string $body, array $headers, float $timeout): array
     {
         $context = stream_context_create(['http' => [
             'method' => 'POST',
             'header' => implode("\r\n", array_map(static fn(string $k, string $v): string => "{$k}: {$v}", array_keys($headers), $headers)),
             'content' => $body,
-            'timeout' => $this->timeout,
+            'timeout' => $timeout,
             'ignore_errors' => true,
             'follow_location' => 0, // it would send the Authorization header on to the new place
         ]]);

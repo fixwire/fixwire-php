@@ -203,17 +203,29 @@ final class Detectors
                 1,
                 self::credentialLike(...),
             ),
+            // A value given to a secret's name, in text, config and URLs. The
+            // name may end a longer one (access_token, client_secret,
+            // csrfToken, PHPSESSID, X-Amz-Signature); an OAuth code counts in
+            // a query or fragment only. The name is bounded and nothing after
+            // it can take back what an atomic group took, so each start costs
+            // the same and the whole text is searched in linear time.
             new Detector(
                 'secret_assignment',
-                ['pass', 'secret', 'token', 'api_key', 'apikey', 'api-key', 'pwd'],
+                ['pass', 'pwd', 'secret', 'key', 'token', 'credential', 'sess', 'sig', 'code'],
                 false,
                 self::re(
-                    self::EDGE . '(?:' . self::anyCase('password') . '|' . self::anyCase('passwd') . '|' . self::anyCase('pwd')
-                    . '|' . self::anyCase('secret') . '|' . self::anyCase('token')
+                    '(?:' . self::anyCase('password') . '|' . self::anyCase('passwd') . '|' . self::anyCase('pwd')
+                    . '|' . self::anyCase('secret') . '(?:[_-]?' . self::anyCase('key') . ')?'
+                    . '|' . self::anyCase('private') . '[_-]?' . self::anyCase('key')
+                    . '|' . self::anyCase('token')
                     . '|' . self::anyCase('api') . '[_-]?' . self::anyCase('key')
-                    . '|' . self::anyCase('access') . '[_-]?' . self::anyCase('key') . ')'
+                    . '|' . self::anyCase('access') . '[_-]?' . self::anyCase('key')
+                    . '|' . self::anyCase('credential') . self::anyCase('s') . '?'
+                    . '|' . self::anyCase('sess') . '(?:' . self::anyCase('ion') . ')?[_-]?' . self::anyCase('id')
+                    . '|' . self::anyCase('sig') . '(?:' . self::anyCase('nature') . ')?'
+                    . '|[?&\#]' . self::anyCase('code') . ')'
                     . '(?>["\']?)(?>' . $ws . '*)[:=](?>' . $ws . '*)(?>["\']?)'
-                    . '([^\t\n\f\r "\',;&]{6,})',
+                    . '((?>[^\t\n\f\r "\',;&]{6,}))',
                 ),
                 1,
                 self::unmasked(...),

@@ -78,8 +78,10 @@ final class Detector
 
             return '';
         };
+        // Past its backtracking or JIT stack limits PCRE stops and says so
+        // only in preg_last_error: the spans so far are not all of them.
         $ok = preg_replace_callback($this->pattern, $collect, $t->s, -1, $count, PREG_OFFSET_CAPTURE);
 
-        return $ok === null ? null : $out;
+        return $ok === null || preg_last_error() !== PREG_NO_ERROR ? null : $out;
     }
 }

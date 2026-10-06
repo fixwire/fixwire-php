@@ -35,7 +35,15 @@ final class Options
     /** The share of new traces kept (default 0: no tracing); continued traces follow the caller. */
     public float $tracesSampleRate = 0.0;
 
-    /** @var list<string> URLs outgoing requests carry trace headers to (those holding one of these). */
+    /**
+     * Where outgoing requests carry trace headers (default: nowhere). A URL is compared without its
+     * user info, query and fragment: a target with "://" matches URLs that start with it
+     * (https://api.example.com/v2); any other is a host, with a port if it has one, and matches
+     * that host and its subdomains (example.com matches api.example.com, not badexample.com). A
+     * target starting with "/" is a path on a browser page's own origin: here it matches nothing.
+     *
+     * @var list<string>
+     */
     public array $tracePropagationTargets = [];
 
     /** @var (callable(Event): ?Event)|null changes an event before it is sent, or drops it by returning null */
@@ -71,10 +79,16 @@ final class Options
     /** Source lines kept around each of your frames (default 5; 0 for none). */
     public int $contextLines = 5;
 
+    /** The frames sent per exception, the newest kept (default 100). */
+    public int $maxStackFrames = 100;
+
+    /** The bytes of UTF-8 a string sent may take (default 1024); a longer one is cut, ending in "...". */
+    public int $maxValueLength = 1024;
+
     /** The events and spans kept until they are sent (default 100). */
     public int $maxQueue = 100;
 
-    /** The timeout of a request to Fixwire, in seconds (default 2: it runs at the end of a request). */
+    /** How long a flush may take to send, in seconds (default 2: at exit, the request waits for it). */
     public float $timeout = 2.0;
 
     /** Log what the SDK does, and what it drops, to PHP's error log; FIXWIRE_DEBUG=1 turns it on too. */
@@ -142,6 +156,8 @@ final class Options
         $this->tracesSampleRate = max(0.0, min(1.0, $this->tracesSampleRate));
         $this->maxBreadcrumbs = max(0, $this->maxBreadcrumbs);
         $this->maxQueue = $this->maxQueue > 0 ? $this->maxQueue : 100;
+        $this->maxStackFrames = $this->maxStackFrames > 0 ? $this->maxStackFrames : 100;
+        $this->maxValueLength = $this->maxValueLength > 0 ? max(4, $this->maxValueLength) : 1024;
         $this->timeout = $this->timeout > 0 ? $this->timeout : 2.0;
         $root = $this->projectRoot ?? self::composerRoot() ?? (getcwd() ?: null);
         $this->projectRoot = $root === null ? null : rtrim($root, '/\\');

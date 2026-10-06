@@ -10,11 +10,27 @@ namespace Fixwire;
  */
 final class Sessions
 {
+    /** The users counted apart per send; past them, requests are counted without their user. */
+    private const MAX_USERS = 5000;
+
+    /** The aggregates per request to Fixwire. */
+    private const MAX_AGGREGATES = 5000;
+
     /** @var array<string, array{minute: int, did: ?string, counts: array{int, int, int}}> exited, errored, crashed */
     private array $buckets = [];
 
+    /** @var array<string, true> the users counted apart since the last send */
+    private array $users = [];
+
     public function record(string $status, ?string $did, float $at): void
     {
+        if ($did !== null && !isset($this->users[$did])) {
+            if (\count($this->users) >= self::MAX_USERS) {
+                $did = null;
+            } else {
+                $this->users[$did] = true;
+            }
+        }
         $minute = (int) (floor($at / 60) * 60);
         $key = $minute . '|' . ($did ?? '');
         $this->buckets[$key] ??= ['minute' => $minute, 'did' => $did, 'counts' => [0, 0, 0]];
@@ -22,15 +38,12 @@ final class Sessions
     }
 
     /**
-     * What was counted, as a /v1/sessions body, or null; forgets it.
+     * What was counted, as /v1/sessions bodies of at most MAX_AGGREGATES each; forgets it.
      *
-     * @return array<string, mixed>|null
+     * @return list<array<string, mixed>>
      */
-    public function take(Options $options): ?array
+    public function take(Options $options): array
     {
-        if ($this->buckets === []) {
-            return null;
-        }
         $aggregates = [];
         foreach ($this->buckets as $b) {
             $a = ['started' => gmdate('Y-m-d\TH:i:s\Z', $b['minute'])];
@@ -40,14 +53,14 @@ final class Sessions
             [$a['exited'], $a['errored'], $a['crashed']] = $b['counts'];
             $aggregates[] = $a;
         }
-        $this->buckets = [];
+        $this->buckets = $this->users = [];
 
-        return [
+        return array_map(static fn(array $chunk): array => [
             'sdk' => Client::sdk(),
             'release' => $options->release,
             'environment' => $options->environment,
-            'aggregates' => $aggregates,
-        ];
+            'aggregates' => $chunk,
+        ], array_chunk($aggregates, self::MAX_AGGREGATES));
     }
 
     /**

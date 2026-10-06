@@ -9,12 +9,20 @@ namespace Fixwire;
  */
 final class Frames
 {
-    /** The previous throwables followed, and the frames kept per exception (the newest). */
+    /** The previous throwables followed, the outermost included. */
     public const MAX_CHAIN = 10;
-    public const MAX_FRAMES = 100;
 
-    /** @var array<string, list<string>> */
+    /** The source files read: regular files of at most MAX_SOURCE_BYTES, MAX_SOURCES of them at a time. */
+    private const MAX_SOURCE_BYTES = 10 * 1024 * 1024;
+    private const MAX_SOURCES = 64;
+
+    /** The bytes of the files the cache holds, before it starts again. */
+    private const MAX_CACHED_BYTES = 16 * 1024 * 1024;
+
+    /** @var array<string, string> file → its text */
     private static array $sources = [];
+
+    private static int $cachedBytes = 0;
 
     /**
      * A throwable and its previous ones, the outermost first.
@@ -54,7 +62,8 @@ final class Frames
     }
 
     /**
-     * A backtrace (debug_backtrace(), the newest call first) where the newest place is $file:$line.
+     * A backtrace (debug_backtrace(), the newest call first) where the newest place is $file:$line;
+     * of a deeper one, the newest max_stack_frames.
      *
      * @param list<array<string, mixed>> $trace
      *
@@ -62,10 +71,11 @@ final class Frames
      */
     public static function fromTrace(array $trace, ?string $file, int $line, Options $options): array
     {
+        $max = max(1, $options->maxStackFrames);
         $frames = []; // the newest first
         foreach ($trace as $t) {
-            if (\count($frames) === self::MAX_FRAMES - 1) {
-                break;
+            if (\count($frames) === $max) {
+                return array_reverse($frames);
             }
             $class = isset($t['class']) && \is_string($t['class']) ? $t['class'] : null;
             $function = isset($t['function']) && \is_string($t['function']) ? $t['function'] : null;
@@ -73,7 +83,9 @@ final class Frames
             $file = isset($t['file']) && \is_string($t['file']) ? $t['file'] : null;
             $line = isset($t['line']) && \is_int($t['line']) ? $t['line'] : 0;
         }
-        $frames[] = self::at(null, '{main}', $file, $line, $options);
+        if (\count($frames) < $max) {
+            $frames[] = self::at(null, '{main}', $file, $line, $options);
+        }
 
         return array_reverse($frames);
     }
@@ -142,27 +154,51 @@ final class Frames
 
     private static function addContext(Frame $f, string $file, int $line, int $around): void
     {
-        $lines = self::$sources[$file] ??= self::read($file);
-        $i = $line - 1;
-        if (!isset($lines[$i])) {
+        $source = self::$sources[$file] ??= self::read($file);
+        // Only the lines around: the file stays one string, not an array of its lines.
+        $first = max(1, $line - $around);
+        $pos = 0;
+        for ($n = 1; $n < $first; $n++) {
+            $pos = strpos($source, "\n", $pos);
+            if ($pos === false) {
+                return;
+            }
+            $pos++;
+        }
+        $lines = [];
+        for ($n = $first; $n <= $line + $around && $pos < \strlen($source); $n++) {
+            $end = strpos($source, "\n", $pos);
+            $lines[$n] = mb_substr(rtrim(substr($source, $pos, $end === false ? null : $end - $pos), "\r"), 0, 300);
+            if ($end === false) {
+                break;
+            }
+            $pos = $end + 1;
+        }
+        if (!isset($lines[$line])) {
             return;
         }
-        $f->contextLine = $lines[$i];
-        $f->preContext = \array_slice($lines, max(0, $i - $around), min($i, $around));
-        $f->postContext = \array_slice($lines, $i + 1, $around);
+        $f->contextLine = $lines[$line];
+        $f->preContext = array_values(array_filter($lines, static fn(int $n): bool => $n < $line, \ARRAY_FILTER_USE_KEY));
+        $f->postContext = array_values(array_filter($lines, static fn(int $n): bool => $n > $line, \ARRAY_FILTER_USE_KEY));
     }
 
-    /** @return list<string> */
-    private static function read(string $file): array
+    /**
+     * A file's text, from a regular file (a FIFO would block, a device never end) of at most
+     * MAX_SOURCE_BYTES, through a cache bounded in files and bytes; '' when it can't be read.
+     */
+    private static function read(string $file): string
     {
-        if (\count(self::$sources) >= 64) {
+        $size = is_file($file) && is_readable($file) ? (int) @filesize($file) : -1;
+        if ($size < 0 || $size > self::MAX_SOURCE_BYTES) {
+            return '';
+        }
+        if (\count(self::$sources) >= self::MAX_SOURCES || self::$cachedBytes + $size > self::MAX_CACHED_BYTES) {
             self::$sources = [];
+            self::$cachedBytes = 0;
         }
-        if (!is_file($file) || !is_readable($file) || (int) @filesize($file) > 1_000_000) {
-            return [];
-        }
-        $lines = @file($file, \FILE_IGNORE_NEW_LINES);
+        self::$cachedBytes += $size;
+        $source = @file_get_contents($file); // no length: PHP 8.1 would allocate all of it up front
 
-        return $lines === false ? [] : array_map(static fn(string $l): string => mb_substr($l, 0, 300), $lines);
+        return $source === false ? '' : $source;
     }
 }

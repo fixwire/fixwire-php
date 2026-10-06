@@ -36,10 +36,11 @@ final class RedactorTest extends TestCase
         self::assertMask("pa\u{17F}\u{17F}word=abcdefgh", [], "pa\u{17F}\u{17F}word=abcdefgh");
         self::assertMask("pa\u{17F}\u{17F}word=[REDACTED:secret_assignment] pwd", ['secret_assignment'], "pa\u{17F}\u{17F}word=abcdefgh pwd");
         self::assertMask("ba\u{17F}ic [REDACTED:http_auth] basic", ['http_auth'], "ba\u{17F}ic dXNlcj" . 'pwYXNz basic');
-        // The long s is no ASCII word character: the word boundary before it
-        // needs a word character on the left.
+        // A secret's name may end a longer one, whatever comes before it.
         self::assertMask("x\u{17F}ecret=[REDACTED:secret_assignment] token", ['secret_assignment'], "x\u{17F}ecret=abcdefgh token");
-        self::assertMask("\u{17F}ecret=abcdefgh token", [], "\u{17F}ecret=abcdefgh token");
+        self::assertMask("\u{17F}ecret=[REDACTED:secret_assignment] token", ['secret_assignment'], "\u{17F}ecret=abcdefgh token");
+        self::assertMask("\u{17F}ecret=abcdefgh", [], "\u{17F}ecret=abcdefgh");
+        self::assertMask("X-Amz-\u{17F}ignature=deadbeefcafe", [], "X-Amz-\u{17F}ignature=deadbeefcafe");
         // U+0130 lower-cases to "i" but folds to nothing.
         self::assertMask("BAS\u{130}C abcdefghijkl1", [], "BAS\u{130}C abcdefghijkl1");
         $count = 0;
@@ -94,6 +95,15 @@ final class RedactorTest extends TestCase
             'gh' . 'p_' . str_repeat('a', 100000),
             str_repeat('pwd: abc ', 11000),
             'password' . str_repeat(' ', 100000),
+            'token' . str_repeat(' ', 100000),
+            'token="' . str_repeat("\t", 50000) . ':' . str_repeat(' ', 50000),
+            str_repeat('sessid', 20000),
+            str_repeat('session_', 20000),
+            str_repeat('?code', 25000),
+            str_repeat('?code=abcde', 12000),
+            str_repeat('secret_', 20000),
+            str_repeat('credentials', 12000),
+            str_repeat('X-Amz-Signature=', 8000),
             str_repeat('Bearer ', 14000),
             str_repeat('AB12 ', 20000),
             str_repeat('+1 2 3 ', 14000),
@@ -114,6 +124,34 @@ final class RedactorTest extends TestCase
         self::assertLessThan(500, (microtime(true) - $start) * 1000);
         self::assertCount(6000, $findings);
         self::assertSame(str_repeat('[REDACTED:email] ', 6000), $masked);
+        // Many keys that mask alike are numbered without counting up from 2 each time.
+        $keys = [];
+        for ($i = 0; $i < 20000; $i++) {
+            $keys["u{$i}@example.com"] = $i;
+        }
+        $start = microtime(true);
+        $count = 0;
+        $out = Redactor::default()->walk($keys, $count);
+        self::assertLessThan(1000, (microtime(true) - $start) * 1000);
+        self::assertSame(20000, $count);
+        self::assertIsArray($out);
+        self::assertArrayHasKey('[REDACTED:email] (20000)', $out);
+    }
+
+    public function testAFailedPatternSendsFiltered(): void
+    {
+        // Past PCRE's limits a pattern stops without its findings: the text
+        // is not sent, masked or not.
+        $limit = (string) ini_get('pcre.backtrack_limit');
+        ini_set('pcre.backtrack_limit', '1');
+        try {
+            self::assertSame(['[Filtered]', ['secret_assignment']], Redactor::default()->mask('token=abcdefgh'));
+            $count = 0;
+            self::assertSame(['m' => '[Filtered]'], Redactor::default()->walk(['m' => 'token=abcdefgh'], $count));
+        } finally {
+            ini_set('pcre.backtrack_limit', $limit);
+        }
+        self::assertSame(['token=[REDACTED:secret_assignment]', ['secret_assignment']], Redactor::default()->mask('token=abcdefgh'));
     }
 
     public function testSensitiveKeys(): void
