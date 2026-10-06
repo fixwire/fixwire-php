@@ -361,6 +361,8 @@ final class Client
         }
         $json = json_encode($body, \JSON_UNESCAPED_SLASHES | \JSON_UNESCAPED_UNICODE | \JSON_INVALID_UTF8_SUBSTITUTE | \JSON_PRESERVE_ZERO_FRACTION | \JSON_PARTIAL_OUTPUT_ON_ERROR);
         if ($json === false) {
+            $this->log("dropping a {$category} request: " . json_last_error_msg());
+
             return false;
         }
         $headers = [
@@ -384,7 +386,7 @@ final class Client
                 return false;
             }
         }
-        $this->log("dropping a {$category} request ({$status})");
+        $this->log("dropping a {$category} request ({$status}" . (isset($answer['error']) ? ': ' . $answer['error'] : '') . ')');
 
         return false;
     }

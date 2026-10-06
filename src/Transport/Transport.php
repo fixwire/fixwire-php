@@ -13,7 +13,7 @@ interface Transport
     /**
      * @param array<string, string> $headers
      *
-     * @return array{0: int, 1: array<string, string>} the status (0 when there was no answer) and the answer's headers, names in lower case
+     * @return array{0: int, 1: array<string, string>} the status (0 when there was no answer) and the answer's headers, names in lower case; with no answer, an "error" entry may say why
      */
     public function send(string $url, string $body, array $headers): array;
 }

@@ -45,9 +45,11 @@ final class HttpTransport implements Transport
             },
         ]);
         $ok = curl_exec($c);
-        $status = $ok === false ? 0 : (int) curl_getinfo($c, \CURLINFO_RESPONSE_CODE);
+        if ($ok === false) {
+            return [0, ['error' => curl_error($c)]]; // no answer: why, for the debug log
+        }
 
-        return [$status, $answer];
+        return [(int) curl_getinfo($c, \CURLINFO_RESPONSE_CODE), $answer];
     }
 
     /**
@@ -66,7 +68,7 @@ final class HttpTransport implements Transport
         ]]);
         $stream = @fopen($url, 'rb', false, $context);
         if ($stream === false) {
-            return [0, []];
+            return [0, ['error' => error_get_last()['message'] ?? 'no answer']];
         }
         // The http wrapper keeps the answer's status line and headers here.
         $lines = stream_get_meta_data($stream)['wrapper_data'] ?? [];
