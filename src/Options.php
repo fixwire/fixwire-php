@@ -174,8 +174,13 @@ final class Options
         if (!self::empty($value)) {
             return $value;
         }
-        $env = getenv($variable);
+        // Dotenv loaders (Symfony's by default) fill $_SERVER and $_ENV, not getenv().
+        foreach ([getenv($variable), $_SERVER[$variable] ?? null, $_ENV[$variable] ?? null] as $env) {
+            if (\is_string($env) && trim($env) !== '') {
+                return $env;
+            }
+        }
 
-        return \is_string($env) && trim($env) !== '' ? $env : null;
+        return null;
     }
 }

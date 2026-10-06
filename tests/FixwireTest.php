@@ -69,6 +69,19 @@ final class FixwireTest extends TestCase
         }
     }
 
+    public function testReadsTheEnvironmentAsDotenvLoadersFillIt(): void
+    {
+        $_SERVER['FIXWIRE_RELEASE'] = 'shop@2.0.0';
+        $_ENV['FIXWIRE_ENVIRONMENT'] = 'staging';
+        try {
+            $o = Options::fromArray([]);
+            $o->applyDefaults();
+            self::assertSame(['shop@2.0.0', 'staging', 'shop'], [$o->release, $o->environment, $o->serviceName]);
+        } finally {
+            unset($_SERVER['FIXWIRE_RELEASE'], $_ENV['FIXWIRE_ENVIRONMENT']);
+        }
+    }
+
     public function testRejectsUnknownOptions(): void
     {
         $this->expectException(\InvalidArgumentException::class);
