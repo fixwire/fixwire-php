@@ -435,6 +435,24 @@ final class FixwireTest extends TestCase
         self::assertCount(1, $ingest->requests('/v1/feedback'));
     }
 
+    public function testNeverThrowsIntoTheApp(): void
+    {
+        // A before_send that returns the wrong thing, and a transport that throws.
+        $ingest = new FakeIngest();
+        $ingest->answer = static function (): never {
+            throw new \RuntimeException('the network is gone');
+        };
+        $hub = $ingest->hub([
+            'before_send' => static fn(Event $e): mixed => str_contains((string) $e->message, 'odd') ? 'not an event' : $e,
+            'release' => 'shop@1.0.0',
+        ]);
+        self::assertNull($hub->captureMessage('an odd one'));
+        self::assertNotNull($hub->captureMessage('a fine one'));
+        self::assertFalse($hub->flush(), 'reported, not thrown');
+        self::assertNull(\Fixwire\captureCheckIn(new \Fixwire\CheckIn('nightly', CheckInStatus::InProgress)));
+        self::assertSame('done', \Fixwire\withMonitor('nightly', null, static fn(): string => 'done'));
+    }
+
     public function testDropsRefusedRequests(): void
     {
         $ingest = new FakeIngest();

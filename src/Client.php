@@ -112,8 +112,19 @@ final class Client
         return isset($this->captured[$throwable]);
     }
 
-    /** @internal sends an event with what the scope knows: its id, or null when not sent */
+    /** @internal sends an event with what the scope knows: its id, or null when not sent (never throws) */
     public function capture(Event $e, Scope $scope, ?Span $span): ?string
+    {
+        try {
+            return $this->doCapture($e, $scope, $span);
+        } catch (\Throwable $ex) {
+            $this->log('capturing an event failed: ' . $ex->getMessage());
+
+            return null;
+        }
+    }
+
+    private function doCapture(Event $e, Scope $scope, ?Span $span): ?string
     {
         if ($this->dsn === null) {
             return null;
@@ -187,15 +198,30 @@ final class Client
             if (!$this->room()) {
                 return;
             }
-            $this->spans[] = Otlp::span($span->record(), $this->redactor);
+            try {
+                $this->spans[] = Otlp::span($span->record(), $this->redactor);
+            } catch (\Throwable $ex) {
+                $this->log('recording a span failed: ' . $ex->getMessage());
+            }
         }
     }
 
     /**
      * Reports a run of a scheduled job, at once: in progress when it starts, then ok or error with
-     * the returned id. Its id, or null when it was not sent.
+     * the returned id. Its id, or null when it was not sent. Never throws.
      */
     public function captureCheckIn(CheckIn $checkIn): ?string
+    {
+        try {
+            return $this->doCaptureCheckIn($checkIn);
+        } catch (\Throwable $ex) {
+            $this->log('sending a check-in failed: ' . $ex->getMessage());
+
+            return null;
+        }
+    }
+
+    private function doCaptureCheckIn(CheckIn $checkIn): ?string
     {
         if ($this->dsn === null || trim($checkIn->monitor) === '') {
             return null;
@@ -217,8 +243,20 @@ final class Client
         return $this->post('/v1/check-ins/' . rawurlencode($checkIn->monitor), self::CHECK_IN, $body) ? $id : null;
     }
 
-    /** @internal */
+    /** @internal queues feedback: its id, or null when not sent (never throws) */
     public function captureFeedback(Feedback $f, Scope $scope, ?Span $span): ?string
+    {
+        try {
+            return $this->doCaptureFeedback($f, $scope, $span);
+        } catch (\Throwable $ex) {
+            $this->log('capturing feedback failed: ' . $ex->getMessage());
+
+            return null;
+        }
+    }
+
+    /** @internal */
+    private function doCaptureFeedback(Feedback $f, Scope $scope, ?Span $span): ?string
     {
         $message = trim((string) $f->message);
         $score = is_finite($f->score) ? max(-1.0, min(1.0, $f->score)) : 0.0;
@@ -265,19 +303,37 @@ final class Client
         if ($session !== null) {
             $this->requests[] = ['/v1/sessions', self::SESSION, $session];
         }
-        foreach (array_chunk($this->records, self::BATCH) as $records) {
-            $ok = $this->post('/v1/logs', self::ERROR, Otlp::logs($this->options, $records)) && $ok;
-        }
-        foreach (array_chunk($this->spans, self::BATCH) as $spans) {
-            $ok = $this->post('/v1/traces', self::SPAN, Otlp::traces($this->options, $spans)) && $ok;
-        }
+        $records = $this->records;
+        $spans = $this->spans;
         $requests = $this->requests;
         $this->records = $this->spans = $this->requests = [];
+        foreach (array_chunk($records, self::BATCH) as $batch) {
+            $ok = $this->send('/v1/logs', self::ERROR, fn(): array => Otlp::logs($this->options, $batch)) && $ok;
+        }
+        foreach (array_chunk($spans, self::BATCH) as $batch) {
+            $ok = $this->send('/v1/traces', self::SPAN, fn(): array => Otlp::traces($this->options, $batch)) && $ok;
+        }
         foreach ($requests as [$path, $category, $body]) {
-            $ok = $this->post($path, $category, $body) && $ok;
+            $ok = $this->send($path, $category, static fn(): array => $body) && $ok;
         }
 
         return $ok;
+    }
+
+    /**
+     * One request, never throwing: a failure is logged (with the debug option) and the data dropped.
+     *
+     * @param \Closure(): array<string, mixed> $body
+     */
+    private function send(string $path, string $category, \Closure $body): bool
+    {
+        try {
+            return $this->post($path, $category, $body());
+        } catch (\Throwable $ex) {
+            $this->log("sending to {$path} failed: " . $ex->getMessage());
+
+            return false;
+        }
     }
 
     private function room(): bool

@@ -111,10 +111,16 @@ final class Hub
         if ($client === null || !$client->isEnabled()) {
             return null;
         }
-        $e = new Event();
-        $e->throwable = $exception;
-        $e->exceptions = Frames::chain($exception, $mechanism, $handled, $client->options());
-        $e->level = $level ?? ($handled ? null : Level::Fatal);
+        try {
+            $e = new Event();
+            $e->throwable = $exception;
+            $e->exceptions = Frames::chain($exception, $mechanism, $handled, $client->options());
+            $e->level = $level ?? ($handled ? null : Level::Fatal);
+        } catch (\Throwable $ex) {
+            $client->log('reading an exception failed: ' . $ex->getMessage()); // never into the app
+
+            return null;
+        }
 
         return self::remember($client->capture($e, $this->getScope(), $this->span));
     }
