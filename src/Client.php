@@ -25,7 +25,7 @@ final class Client
     private const CHECK_IN = 'check_in';
     private const FEEDBACK = 'feedback';
 
-    /** The categories a rate limit may name (sdks/PROTOCOL.md §2); others are ignored. */
+    /** The categories a rate limit may name (fixwire-protocol §2); others are ignored. */
     private const CATEGORIES = ['error', 'log', 'span', 'session', 'check_in', 'feedback', 'file'];
 
     /** The log records and spans per request to Fixwire. */

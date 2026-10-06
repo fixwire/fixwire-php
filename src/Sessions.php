@@ -6,7 +6,7 @@ namespace Fixwire;
 
 /**
  * @internal release health: each request is a session, counted per minute and user, and sent
- * with the rest when the client flushes (sdks/PROTOCOL.md §5)
+ * with the rest when the client flushes (fixwire-protocol §5)
  */
 final class Sessions
 {

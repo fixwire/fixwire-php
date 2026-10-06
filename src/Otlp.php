@@ -7,7 +7,7 @@ namespace Fixwire;
 use Fixwire\Internal\Redaction\Redactor;
 
 /**
- * @internal events and spans as OTLP JSON (sdks/PROTOCOL.md §3, §4), within the limits every
+ * @internal events and spans as OTLP JSON (fixwire-protocol §3, §4), within the limits every
  * Fixwire SDK keeps (§13)
  */
 final class Otlp
@@ -98,7 +98,7 @@ final class Otlp
     }
 
     /**
-     * An error or a message as a log record (sdks/PROTOCOL.md §4), redacted and cut. The app's
+     * An error or a message as a log record (fixwire-protocol §4), redacted and cut. The app's
      * values (tags, contexts, extras, breadcrumbs' data) are each a value within the limits; the
      * lists the SDK makes (the exceptions, their frames, the breadcrumbs) are kept whole.
      *
