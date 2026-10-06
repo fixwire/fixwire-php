@@ -46,8 +46,8 @@ final class Client
     /** The wait before the one retry of a request, in seconds (more tries would hold up the exit). */
     private const BACKOFF = 1.0;
 
-    /** Where PHP-FPM workers share their pauses. */
-    private const SHARED_PAUSES = 'fixwire.rate_limits';
+    /** Where PHP-FPM workers share their pauses, followed by the project's hash. */
+    private const SHARED_PAUSES = 'fixwire.rate_limits.';
 
     /** How bodies are encoded (and batches measured). */
     private const JSON = \JSON_UNESCAPED_SLASHES | \JSON_UNESCAPED_UNICODE | \JSON_INVALID_UTF8_SUBSTITUTE | \JSON_PRESERVE_ZERO_FRACTION | \JSON_PARTIAL_OUTPUT_ON_ERROR;
@@ -76,13 +76,16 @@ final class Client
     /** @var \WeakMap<\Throwable, bool> */
     private \WeakMap $captured;
 
-    /** Whether a request of this flush got no answer: the rest are dropped, not each waiting as long. */
-    private bool $unreachable = false;
+    /** The pause after Fixwire didn't answer, shared by the PHP-FPM workers through APCu. */
+    private readonly Unreachable $unreachable;
+
+    /** The project's pauses are its own: a hash of the DSN, so apps sharing a server don't pause each other. */
+    private readonly string $project;
 
     /** The process whose data is queued: a child of pcntl_fork() leaves it to its parent. */
     private int $pid;
 
-    /** @var array<string, float> category ("" for all) → paused until, within this process */
+    /** @var array<string, array<string, float>> project → category ("" for all) → paused until, within this process */
     private static array $paused = [];
 
     /**
@@ -115,6 +118,8 @@ final class Client
             $dsn = null;
         }
         $this->dsn = $dsn;
+        $this->unreachable = Unreachable::of($dsn === null ? '' : $dsn->baseUrl);
+        $this->project = $dsn === null ? '' : substr(hash('sha256', $dsn->key . '@' . $dsn->baseUrl), 0, 16);
         $this->sessions = $this->dsn !== null && $options->sessionsOn() ? new Sessions() : null;
         $this->captured = new \WeakMap();
         $this->pid = (int) getmypid();
@@ -135,6 +140,14 @@ final class Client
     public function isEnabled(): bool
     {
         return $this->dsn !== null;
+    }
+
+    /** @internal whether something waits for the next flush */
+    public function hasQueued(): bool
+    {
+        $this->ownQueue();
+
+        return $this->dsn !== null && ($this->records !== [] || $this->spans !== [] || $this->requests !== [] || $this->sessions?->isEmpty() === false);
     }
 
     /** The options, defaults filled in. */
@@ -453,7 +466,6 @@ final class Client
     {
         $this->ownQueue();
         $ok = true;
-        $this->unreachable = false;
         foreach ($this->sessions?->take($this->options) ?? [] as $session) {
             $this->requests[] = ['/v1/sessions', self::SESSION, $session];
         }
@@ -481,11 +493,6 @@ final class Client
      */
     private function send(string $path, string $category, \Closure $body, float $deadline): bool
     {
-        if ($this->unreachable) {
-            $this->log("dropping a {$category} request: Fixwire did not answer");
-
-            return false;
-        }
         try {
             return $this->post($path, $category, $body(), $deadline);
         } catch (\Throwable $ex) {
@@ -547,7 +554,8 @@ final class Client
     /**
      * Sends one request now, by $deadline, honouring rate limits. A request without an answer, or
      * with a 5xx, is tried once more BACKOFF later (unless the answer paused it, or that would pass
-     * the deadline): PHP sends at exit, where more tries would hold the app up.
+     * the deadline): PHP sends at exit, where more tries would hold the app up. Still no answer
+     * pauses sending to Fixwire, for every worker of the server (see Unreachable).
      *
      * @param array<string, mixed> $body
      */
@@ -574,9 +582,17 @@ final class Client
             $headers['Content-Encoding'] = 'gzip';
         }
         $url = $this->dsn->url($path);
+        if (!$this->unreachable->allows(microtime(true), $deadline)) {
+            $this->log("dropping a {$category} request: Fixwire did not answer lately");
+
+            return false;
+        }
         for ($attempt = 0; ; $attempt++) {
             $left = $deadline - microtime(true);
             if ($left <= 0.001) {
+                if ($attempt > 0) {
+                    break; // no time left for the retry: as without one
+                }
                 $this->log("dropping a {$category} request: out of time");
 
                 return false;
@@ -584,6 +600,9 @@ final class Client
             [$status, $answer] = $this->transport instanceof HttpTransport
                 ? $this->transport->sendWithin($url, $json, $headers, $left)
                 : $this->transport->send($url, $json, $headers);
+            if ($status !== 0) {
+                $this->unreachable->answered();
+            }
             $this->limit($answer['fixwire-rate-limits'] ?? null, $status, $answer['retry-after'] ?? null);
             if ($status >= 200 && $status < 300) {
                 return true;
@@ -599,7 +618,9 @@ final class Client
             }
             usleep((int) (self::BACKOFF * 1e6));
         }
-        $this->unreachable = $status === 0;
+        if ($status === 0) {
+            $this->unreachable->failed(microtime(true));
+        }
         $this->log("dropping a {$category} request ({$status}" . (isset($answer['error']) ? ': ' . $answer['error'] : '') . ')');
 
         return false;
@@ -608,7 +629,7 @@ final class Client
     private function paused(string $category): bool
     {
         $now = microtime(true);
-        foreach ([self::$paused, self::sharedPauses()] as $paused) {
+        foreach ([self::$paused[$this->project] ?? [], $this->sharedPauses()] as $paused) {
             if (($paused[$category] ?? 0) > $now || ($paused[''] ?? 0) > $now) {
                 return true;
             }
@@ -618,16 +639,16 @@ final class Client
     }
 
     /**
-     * The pauses the PHP-FPM workers of this server share through APCu.
+     * The project's pauses the PHP-FPM workers of this server share through APCu.
      *
      * @return array<string, float> category ("" for all) → paused until
      */
-    private static function sharedPauses(): array
+    private function sharedPauses(): array
     {
         if (!\function_exists('apcu_fetch') || !\function_exists('apcu_enabled') || !apcu_enabled()) {
             return [];
         }
-        $stored = apcu_fetch(self::SHARED_PAUSES);
+        $stored = apcu_fetch(self::SHARED_PAUSES . $this->project);
         $out = [];
         foreach (\is_array($stored) ? $stored : [] as $category => $until) {
             if (\is_string($category) && (\is_float($until) || \is_int($until))) {
@@ -669,17 +690,17 @@ final class Client
             return;
         }
         foreach ($pauses as $cat => $secs) {
-            self::$paused[$cat] = max(self::$paused[$cat] ?? 0, $now + $secs);
+            self::$paused[$this->project][$cat] = max(self::$paused[$this->project][$cat] ?? 0, $now + $secs);
         }
         if (\function_exists('apcu_store') && \function_exists('apcu_enabled') && apcu_enabled()) {
             // Shared with the other requests of this server, whose pauses of other categories stay.
-            $shared = self::sharedPauses();
-            foreach (self::$paused as $cat => $until) {
+            $shared = $this->sharedPauses();
+            foreach (self::$paused[$this->project] as $cat => $until) {
                 $shared[$cat] = max($shared[$cat] ?? 0, $until);
             }
             $shared = array_filter($shared, static fn(float $until): bool => $until > $now);
             if ($shared !== []) {
-                apcu_store(self::SHARED_PAUSES, $shared, (int) ceil(max($shared) - $now));
+                apcu_store(self::SHARED_PAUSES . $this->project, $shared, (int) ceil(max($shared) - $now));
             }
         }
     }
@@ -712,12 +733,13 @@ final class Client
         return (int) min(max(0, ceil($date->getTimestamp() - $now)), self::MAX_PAUSE);
     }
 
-    /** @internal forgets the rate limits (tests) */
+    /** @internal forgets the rate limits and the pauses after no answer (tests) */
     public static function resetRateLimits(): void
     {
         self::$paused = [];
-        if (\function_exists('apcu_delete') && \function_exists('apcu_enabled') && apcu_enabled()) {
-            apcu_delete(self::SHARED_PAUSES);
+        Unreachable::reset();
+        if (\function_exists('apcu_delete') && \function_exists('apcu_enabled') && apcu_enabled() && class_exists(\APCUIterator::class)) {
+            apcu_delete(new \APCUIterator('/^' . preg_quote(self::SHARED_PAUSES, '/') . '/'));
         }
     }
 

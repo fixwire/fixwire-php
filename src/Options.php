@@ -88,8 +88,16 @@ final class Options
     /** The events and spans kept until they are sent (default 100). */
     public int $maxQueue = 100;
 
-    /** How long a flush may take to send, in seconds (default 2: at exit, the request waits for it). */
+    /** How long a flush may take to send, in seconds (default 2: at exit, the PHP process waits for it). */
     public float $timeout = 2.0;
+
+    /**
+     * Under PHP-FPM or LiteSpeed, end the response (and write the session) before sending at exit,
+     * so that the client doesn't wait for Fixwire (on). Turn it off if destructors, which PHP runs
+     * after the shutdown functions, still print, send headers or change $_SESSION: once the
+     * response has ended, that is lost.
+     */
+    public bool $finishRequest = true;
 
     /** Log what the SDK does, and what it drops, to PHP's error log; FIXWIRE_DEBUG=1 turns it on too. */
     public bool $debug = false;

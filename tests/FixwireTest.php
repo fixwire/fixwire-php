@@ -12,6 +12,7 @@ use Fixwire\Dsn;
 use Fixwire\Event;
 use Fixwire\ExceptionValue;
 use Fixwire\Feedback;
+use Fixwire\FlushAtExit;
 use Fixwire\Frame;
 use Fixwire\Frames;
 use Fixwire\Hub;
@@ -23,7 +24,9 @@ use Fixwire\Scope;
 use Fixwire\Sessions;
 use Fixwire\Span;
 use Fixwire\SpanKind;
+use Fixwire\Unreachable;
 use Fixwire\User;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 final class CartException extends \RuntimeException {}
@@ -492,6 +495,25 @@ final class FixwireTest extends TestCase
         self::assertCount(1, $ingest->requests('/v1/feedback'));
     }
 
+    public function testPausesOnlyTheProjectThatWasRateLimited(): void
+    {
+        $limited = new FakeIngest();
+        $limited->answer = static fn(): array => [200, ['fixwire-rate-limits' => '3600:']];
+        $limited->hub()->captureMessage('first');
+        self::assertTrue(Hub::current()->flush());
+        // Another app on the same server, with a project of its own, still sends.
+        $other = new FakeIngest();
+        $hub = $other->hub(['dsn' => 'http://otherkey@ingest.test']);
+        $hub->captureMessage('second');
+        self::assertTrue($hub->flush());
+        self::assertCount(1, $other->requests('/v1/logs'));
+        // The first project stays paused.
+        $hub = $limited->hub();
+        $hub->captureMessage('dropped');
+        self::assertFalse($hub->flush());
+        self::assertCount(1, $limited->requests('/v1/logs'));
+    }
+
     public function testSendsARequestAtMostTwiceWithinTheProtocolsFour(): void
     {
         foreach ([[503, 2], [429, 1]] as [$status, $sent]) {
@@ -731,8 +753,10 @@ final class FixwireTest extends TestCase
             $hub->captureMessage('first');
             $now = microtime(true);
             $hub->flush();
-            $paused = (new \ReflectionProperty(Client::class, 'paused'))->getValue();
-            self::assertIsArray($paused);
+            $projects = (new \ReflectionProperty(Client::class, 'paused'))->getValue();
+            self::assertIsArray($projects);
+            self::assertLessThanOrEqual(1, \count($projects), "case {$i}: one project");
+            $paused = $projects === [] ? [] : array_values($projects)[0];
             self::assertSame(array_keys($expected), array_keys($paused), "case {$i}");
             foreach ($expected as $category => $seconds) {
                 self::assertEqualsWithDelta($now + $seconds, $paused[$category], 2.5, "case {$i}: {$category}");
@@ -751,7 +775,7 @@ final class FixwireTest extends TestCase
         self::assertCount(1, $ingest->requests(), 'paused');
     }
 
-    public function testStopsAFlushWhenFixwireDoesNotAnswer(): void
+    public function testStopsSendingForAWhileWhenFixwireDoesNotAnswer(): void
     {
         $ingest = new FakeIngest();
         $ingest->answer = static fn(): array => [0, ['error' => 'Connection timed out']];
@@ -761,9 +785,129 @@ final class FixwireTest extends TestCase
         $hub->captureFeedback(new Feedback('slow'));
         self::assertFalse($hub->flush());
         self::assertCount(2, $ingest->requests(), 'the logs, tried twice; not the spans nor the feedback');
+
+        // The next requests, of this client or another one sending there, wait out the pause.
         $hub->captureMessage('two');
         self::assertFalse($hub->flush());
-        self::assertCount(4, $ingest->requests(), 'the next flush tries again');
+        $other = new FakeIngest();
+        $other->hub()->captureMessage('three');
+        self::assertFalse(\Fixwire\flush());
+        self::assertNull(\Fixwire\captureCheckIn(new \Fixwire\CheckIn('nightly', CheckInStatus::InProgress)));
+        self::assertSame([2, 0], [\count($ingest->requests()), \count($other->requests())], 'nothing sent: not a timeout each');
+
+        // Once it is over, a request tries again; an answer ends the pause.
+        self::agePauses(Unreachable::FIRST);
+        $other->answer = static fn(): array => [200, []];
+        \Fixwire\captureMessage('four');
+        self::assertTrue(\Fixwire\flush());
+        \Fixwire\captureMessage('five');
+        self::assertTrue(\Fixwire\flush());
+        self::assertCount(2, $other->requests('/v1/logs'));
+    }
+
+    /** @return iterable<string, array{bool}> */
+    public static function pauseStores(): iterable
+    {
+        yield 'per process' => [false];
+        yield 'APCu' => [true];
+    }
+
+    #[DataProvider('pauseStores')]
+    public function testPausesEveryWorkerAfterNoAnswerTwiceAsLongEachTime(bool $apcu): void
+    {
+        if ($apcu && !(\function_exists('apcu_enabled') && apcu_enabled())) {
+            self::markTestSkipped('needs APCu (apc.enable_cli=1)');
+        }
+        // Two PHP-FPM workers sending to one host, sharing its pause; the time is given.
+        $a = new Unreachable('https://ingest.test', $apcu);
+        $b = new Unreachable('https://ingest.test', $apcu);
+        $now = 1_000_000.0;
+        self::assertTrue($a->allows($now, $now + 2));
+        $a->failed($now += 2);
+        $b->failed($now + 1); // a request on its way meanwhile: the same outage, not a longer pause
+        self::assertTrue((new Unreachable('https://self-hosted.test', $apcu))->allows($now, $now + 2), 'another host is not paused');
+
+        foreach ([10, 20, 40, 80, 160, 300, 300] as $pause) {
+            self::assertFalse($a->allows($now + $pause - 0.1, $now + $pause + 2), "{$pause} s");
+            self::assertFalse($b->allows($now + $pause - 0.1, $now + $pause + 2), "{$pause} s");
+            $now += $pause;
+            // Over: one worker tries, until its deadline; the others wait for its answer.
+            self::assertTrue($b->allows($now, $now + 2), "{$pause} s: tries");
+            self::assertTrue($b->allows($now + 1, $now + 2), 'its next request too');
+            self::assertFalse($a->allows($now + 1, $now + 3), "{$pause} s: waits");
+            $b->failed($now += 2); // no answer again: twice as long, up to 5 minutes
+        }
+
+        // An answer ends the pause for every worker; the next outage starts at 10 s again.
+        $now += 300;
+        self::assertTrue($a->allows($now, $now + 2));
+        $b->answered(); // not the one trying: changes nothing
+        self::assertFalse($b->allows($now + 1, $now + 3));
+        $a->answered();
+        self::assertTrue($b->allows($now + 1, $now + 3));
+        $b->failed($now += 3);
+        self::assertFalse($a->allows($now + 9.9, $now + 12));
+        self::assertTrue($a->allows($now + 10, $now + 12));
+
+        // A worker that took the try and never told holds it until its deadline only.
+        self::assertFalse($b->allows($now + 11.9, $now + 14));
+        self::assertTrue($b->allows($now + 12, $now + 14));
+
+        // A pause that ended more than 5 minutes ago is forgotten: the next is 10 s.
+        $b->failed($now += 13); // 20 s
+        $now += 20 + Unreachable::LONGEST + 1;
+        self::assertTrue($a->allows($now, $now + 2));
+        $a->failed($now);
+        self::assertFalse($b->allows($now + 9.9, $now + 12));
+        self::assertTrue($b->allows($now + 10, $now + 12));
+    }
+
+    /** Makes the pauses after no answer older by $seconds, wherever they are kept. */
+    private static function agePauses(float $seconds): void
+    {
+        $memory = new \ReflectionProperty(Unreachable::class, 'memory');
+        $apcu = \function_exists('apcu_enabled') && apcu_enabled();
+        foreach (array_keys((array) (new \ReflectionProperty(Unreachable::class, 'keys'))->getValue()) as $key) {
+            $kept = (array) $memory->getValue();
+            $state = $apcu ? apcu_fetch($key) : ($kept[$key] ?? null);
+            if (\is_array($state)) {
+                $state['until'] -= $seconds;
+                $apcu ? apcu_store($key, $state) : $memory->setValue(null, [$key => $state] + $kept);
+            }
+        }
+    }
+
+    public function testEndsTheResponseBeforeSendingAtExitUnderPhpFpmAndLiteSpeed(): void
+    {
+        $there = static fn(string $function): bool => true;
+        self::assertSame('fastcgi_finish_request', FlushAtExit::ender('fpm-fcgi', true, true, $there));
+        self::assertSame('litespeed_finish_request', FlushAtExit::ender('litespeed', true, true, $there));
+        foreach (['cli', 'cli-server', 'phpdbg', 'embed', 'cgi-fcgi', 'apache2handler', 'frankenphp'] as $sapi) {
+            self::assertNull(FlushAtExit::ender($sapi, true, true, $there), $sapi);
+        }
+        self::assertNull(FlushAtExit::ender('fpm-fcgi', false, true, $there), 'finish_request off');
+        self::assertNull(FlushAtExit::ender('fpm-fcgi', true, false, $there), 'nothing to send');
+        self::assertNull(FlushAtExit::ender('fpm-fcgi', true, true, static fn(string $function): bool => false), 'a disabled function');
+        self::assertNull(FlushAtExit::ender('fpm-fcgi', true, true), 'none in the CLI');
+
+        $o = Options::fromArray(['finish_request' => false]);
+        self::assertSame([false, []], [$o->finishRequest, $o->problems()]);
+        self::assertTrue((new Options())->finishRequest, 'on by default');
+
+        // Whether there is anything to send: events, spans, feedback, sessions.
+        $hub = (new FakeIngest())->hub(['release' => 'shop@1.0.0', 'auto_session_tracking' => true]);
+        $client = $hub->getClient();
+        self::assertNotNull($client);
+        self::assertFalse($client->hasQueued());
+        $hub->captureMessage('queued');
+        self::assertTrue($client->hasQueued());
+        $hub->flush();
+        self::assertFalse($client->hasQueued());
+        ($hub->startRequestSession())();
+        self::assertTrue($client->hasQueued(), 'a session counted');
+        $hub->flush();
+        self::assertFalse($client->hasQueued());
+        self::assertFalse((new Client(Options::fromArray(['transport' => new FakeIngest()])))->hasQueued(), 'without a DSN');
     }
 
     public function testSplitsBatchesByTheirSize(): void

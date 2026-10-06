@@ -37,6 +37,12 @@ final class Sessions
         $this->buckets[$key]['counts'][$status === 'crashed' ? 2 : ($status === 'errored' ? 1 : 0)]++;
     }
 
+    /** Whether nothing was counted since the last send. */
+    public function isEmpty(): bool
+    {
+        return $this->buckets === [];
+    }
+
     /**
      * What was counted, as /v1/sessions bodies of at most MAX_AGGREGATES each; forgets it.
      *

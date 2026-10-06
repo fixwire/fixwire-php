@@ -1,7 +1,7 @@
 <?php
 
 // A fake Fixwire for `php -S`: appends each request (path, headers, decoded body) to the file in
-// FAKE_INGEST_LOG as a JSON line.
+// FAKE_INGEST_LOG as a JSON line, then answers (FAKE_INGEST_DELAY seconds later, if set).
 
 declare(strict_types=1);
 
@@ -21,5 +21,6 @@ file_put_contents(
     json_encode(['path' => $path, 'headers' => $headers, 'body' => json_decode($raw, true)]) . "\n",
     \FILE_APPEND | \LOCK_EX,
 );
+usleep((int) ((float) getenv('FAKE_INGEST_DELAY') * 1e6));
 header('Content-Type: application/json');
 echo '{}';

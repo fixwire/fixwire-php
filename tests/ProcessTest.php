@@ -8,8 +8,8 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 /**
- * What ends a PHP process (uncaught exceptions, fatal errors) and what serves a web request, in
- * child processes that send over HTTP to a fake Fixwire run by `php -S`.
+ * What ends a PHP process (uncaught exceptions, fatal errors) and what serves a web request (`php -S`,
+ * php-fpm), in child processes that send over HTTP to a fake Fixwire run by `php -S`.
  */
 final class ProcessTest extends TestCase
 {
@@ -171,6 +171,171 @@ final class ProcessTest extends TestCase
             }
         }
         self::assertSame([1, 1], [array_sum(array_column($sessions, 'exited')), array_sum(array_column($sessions, 'crashed'))]);
+    }
+
+    public function testEndsTheResponseBeforeSendingUnderPhpFpm(): void
+    {
+        $fpm = self::phpFpm();
+        if ($fpm === null) {
+            self::markTestSkipped('needs php-fpm for this PHP (or PHP_FPM pointing at it)');
+        }
+        // A Fixwire that answers 2 seconds after it got a request.
+        $port = $this->serve(__DIR__ . '/fixtures/ingest.php', ['FAKE_INGEST_LOG' => $this->log, 'FAKE_INGEST_DELAY' => '2']);
+        $dir = sys_get_temp_dir() . '/fixwire-fpm-' . bin2hex(random_bytes(4));
+        mkdir($dir);
+        $server = null;
+        try {
+            [$fastcgi, $server] = self::startFpm($fpm, $dir, ['FIXWIRE_DSN' => "http://publickey@127.0.0.1:{$port}", 'SESSION_DIR' => $dir]);
+
+            // finish_request off: the response waits for Fixwire's answer, as it used to.
+            [$out, $took] = self::page($fastcgi, 'finish=0');
+            self::assertStringEndsWith("\r\n\r\nhello, goodbye", $out);
+            self::assertGreaterThanOrEqual(2.0, $took);
+
+            // On (the default): the response ends after the app's shutdown functions, before the SDK sends.
+            [$out, $took] = self::page($fastcgi, 'finish=1');
+            self::assertStringEndsWith("\r\n\r\nhello, goodbye", $out, "the output buffer and the shutdown function's output went out");
+            self::assertLessThan(1.5, $took, 'not waiting for Fixwire');
+            self::assertStringContainsString('seen|s:7:"at exit"', (string) file_get_contents("{$dir}/sess_fixwire1"), 'the session was written before');
+
+            $sent = array_map(static fn(array $r): mixed => FakeIngest::anyValue(FakeIngest::logRecords([$r])[0]['body']), $this->received(2));
+            self::assertSame(['page served', 'page served'], $sent, 'sent after the response ended');
+        } finally {
+            if (\is_resource($server)) {
+                proc_terminate($server);
+                proc_close($server);
+            }
+            array_map('unlink', glob("{$dir}/*") ?: []);
+            rmdir($dir);
+        }
+    }
+
+    /** A php-fpm of this PHP's version, or null. */
+    private static function phpFpm(): ?string
+    {
+        if (\PHP_OS_FAMILY === 'Windows') {
+            return null;
+        }
+        $prefix = \dirname(\PHP_BINARY, 2);
+        $version = \PHP_MAJOR_VERSION . '.' . \PHP_MINOR_VERSION;
+        foreach ([getenv('PHP_FPM'), "{$prefix}/sbin/php-fpm", "{$prefix}/sbin/php-fpm{$version}"] as $fpm) {
+            if (\is_string($fpm) && $fpm !== '' && is_file($fpm) && is_executable($fpm)) {
+                return $fpm;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Starts php-fpm with one worker on a free port, its environment passed on to the worker.
+     *
+     * @param array<string, string> $env
+     *
+     * @return array{0: int, 1: resource} the port, and php-fpm
+     */
+    private static function startFpm(string $fpm, string $dir, array $env): array
+    {
+        $probe = stream_socket_server('tcp://127.0.0.1:0');
+        self::assertNotFalse($probe);
+        $port = (int) substr((string) strrchr((string) stream_socket_get_name($probe, false), ':'), 1);
+        fclose($probe);
+        file_put_contents("{$dir}/fpm.conf", implode("\n", [
+            '[global]',
+            "error_log = {$dir}/fpm.log",
+            "pid = {$dir}/fpm.pid",
+            '[www]',
+            "listen = 127.0.0.1:{$port}",
+            'pm = static',
+            'pm.max_children = 1',
+            'clear_env = no',
+            'catch_workers_output = yes',
+        ]) . "\n");
+        $root = \function_exists('posix_geteuid') && posix_geteuid() === 0 ? ['--allow-to-run-as-root'] : [];
+        $server = proc_open(
+            [$fpm, '--nodaemonize', '--fpm-config', "{$dir}/fpm.conf", ...$root],
+            [0 => ['file', '/dev/null', 'r'], 1 => ['file', '/dev/null', 'w'], 2 => ['file', '/dev/null', 'w']],
+            $pipes,
+            null,
+            $env + getenv(),
+        );
+        self::assertIsResource($server);
+        for ($i = 0; $i < 100; $i++) {
+            $up = @fsockopen('127.0.0.1', $port, $errno, $error, 0.1);
+            if ($up !== false) {
+                fclose($up);
+
+                return [$port, $server];
+            }
+            usleep(50_000);
+        }
+        proc_terminate($server);
+        proc_close($server);
+        self::fail("php-fpm did not start on {$port}: " . @file_get_contents("{$dir}/fpm.log"));
+    }
+
+    /**
+     * Asks php-fpm for tests/fixtures/fpm.php over FastCGI, as a web server would.
+     *
+     * @return array{0: string, 1: float} what it answered (headers and body), and the seconds until
+     *                                    it ended the response
+     */
+    private static function page(int $port, string $query): array
+    {
+        $script = __DIR__ . '/fixtures/fpm.php';
+        $params = [
+            'GATEWAY_INTERFACE' => 'FastCGI/1.0',
+            'REQUEST_METHOD' => 'GET',
+            'SCRIPT_FILENAME' => $script,
+            'SCRIPT_NAME' => '/fpm.php',
+            'REQUEST_URI' => "/fpm.php?{$query}",
+            'QUERY_STRING' => $query,
+            'DOCUMENT_ROOT' => \dirname($script),
+            'SERVER_PROTOCOL' => 'HTTP/1.1',
+            'SERVER_NAME' => 'shop.test',
+            'SERVER_PORT' => '80',
+            'REMOTE_ADDR' => '127.0.0.1',
+            'HTTP_HOST' => 'shop.test',
+        ];
+        $length = static fn(string $s): string => \strlen($s) < 128 ? \chr(\strlen($s)) : pack('N', \strlen($s) | 0x80000000);
+        $pairs = '';
+        foreach ($params as $name => $value) {
+            $pairs .= $length($name) . $length($value) . $name . $value;
+        }
+        // Records: version 1, type, request id 1, content length, no padding.
+        $record = static fn(int $type, string $content): string => pack('CCnnCx', 1, $type, 1, \strlen($content), 0) . $content;
+        $socket = stream_socket_client("tcp://127.0.0.1:{$port}", $errno, $error, 5);
+        self::assertNotFalse($socket, $error);
+        stream_set_timeout($socket, 30);
+        $start = microtime(true);
+        // BEGIN_REQUEST as a responder, PARAMS, then an empty STDIN.
+        fwrite($socket, $record(1, pack('nCx5', 1, 0)) . $record(4, $pairs) . $record(4, '') . $record(5, ''));
+        $out = '';
+        while (\strlen($header = self::read($socket, 8)) === 8) {
+            /** @var array{type: int, length: int, padding: int} $h */
+            $h = unpack('Cversion/Ctype/nid/nlength/Cpadding/Creserved', $header);
+            $content = self::read($socket, $h['length'] + $h['padding']);
+            if ($h['type'] === 6) { // STDOUT
+                $out .= substr($content, 0, $h['length']);
+            } elseif ($h['type'] === 3) { // END_REQUEST
+                $took = microtime(true) - $start;
+                fclose($socket);
+
+                return [$out, $took];
+            }
+        }
+        self::fail("php-fpm closed the connection without ending the request: {$out}");
+    }
+
+    /** @param resource $socket */
+    private static function read($socket, int $bytes): string
+    {
+        $data = '';
+        while (\strlen($data) < $bytes && !feof($socket)) {
+            $data .= (string) fread($socket, $bytes - \strlen($data));
+        }
+
+        return $data;
     }
 
     /**

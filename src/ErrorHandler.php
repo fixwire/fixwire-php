@@ -109,10 +109,8 @@ final class ErrorHandler
             )];
             $hub->captureEvent($e);
         }
-        // Last of all, after the app's own shutdown functions: send.
-        register_shutdown_function(static function (): void {
-            Hub::current()->flush();
-        });
+        // Last of all, after the app's own shutdown functions: send (the response ended first).
+        register_shutdown_function([FlushAtExit::class, 'flush']);
     }
 
     private static function name(int $type): string

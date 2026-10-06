@@ -71,8 +71,17 @@ the request is a server span that continues the caller's trace.
 
 PHP runs a request and forgets it, so nothing is sent while the request
 runs. What was captured is sent at its end, after your own shutdown
-functions, in one request per kind of data. Long-running workers call
+functions, in one request per kind of data. Under PHP-FPM and LiteSpeed
+the response has gone out by then: the SDK writes the session and ends
+the response first (`fastcgi_finish_request()`, as Symfony and Laravel
+do), so your users don't wait for Fixwire. Long-running workers call
 `Fixwire\flush()` after each job.
+
+When Fixwire doesn't answer, nothing is sent to it for 10 seconds, then
+twice as long each time it still doesn't, up to 5 minutes, until it
+answers. With APCu, the PHP-FPM workers of a server share that pause and
+only one of them tries again: an outage costs one timeout per pause, not
+one per request.
 
 ### Quick usage example
 
@@ -171,8 +180,9 @@ feedback score opens a `user_feedback` issue for the agent run.
   to `trace_propagation_targets`.
 - **Your data is kept in Europe.**
 - **Made for PHP**: no required packages, rate limits that pause only the
-  kind of data they name and are shared by every PHP-FPM worker of a server
-  when APCu is there, and data sent after your own shutdown functions.
+  kind of data they name and, like the pause during an outage, are shared by
+  every PHP-FPM worker of a server when APCu is there, and data sent after
+  your own shutdown functions, once PHP-FPM has sent the response.
 
 ## 🧩 Integrations
 
@@ -243,7 +253,8 @@ Options are snake_case keys of the array `init()` takes.
 | `max_stack_frames` | 100 | Frames per exception, the newest kept |
 | `max_value_length` | 1024 | Bytes of UTF-8 per string sent; longer ones are cut, ending in `...` |
 | `max_breadcrumbs`, `max_queue` | 100, 100 | Breadcrumbs kept; events and spans waiting to be sent |
-| `timeout` | 2 s | How long a flush may take (at exit, the request waits for it) |
+| `timeout` | 2 s | How long a flush may take (at exit, the PHP process waits for it) |
+| `finish_request` | on | Under PHP-FPM and LiteSpeed, write the session and end the response before sending at exit. Turn it off if destructors, which PHP runs after the shutdown functions, still print, send headers or change `$_SESSION` |
 | `debug` | off | Log what the SDK does and drops to PHP's error log; `FIXWIRE_DEBUG=1` too |
 
 `init()` never throws: an option that doesn't exist or has the wrong type,

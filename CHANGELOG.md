@@ -6,6 +6,9 @@ API.
 
 ## [Unreleased]
 
+- Under PHP-FPM and LiteSpeed, what was captured is sent after the response has ended: last of the shutdown functions, the SDK writes the session and calls `fastcgi_finish_request()` (`litespeed_finish_request()`), so the client no longer waits for Fixwire. `finish_request` (new, on) turns it off.
+- When Fixwire doesn't answer, nothing is sent to it for 10 s, then twice as long after each try that gets no answer either (up to 5 minutes), until it answers.
+- Rate-limit pauses belong to the project they were given for: apps sharing a PHP-FPM server (and its APCu) no longer pause each other. PHP-FPM workers share the pause through APCu and only one tries when it ends: an outage costs one timeout per pause, not every request's.
 - `init` never throws: an option that doesn't exist or has the wrong type, or a malformed DSN, is said on PHP's error log (debug or not) and the SDK stays off.
 - Long messages no longer stall a capture: the error budget reads only a message's first kilobyte (300 kB of some text took seconds).
 - Without curl, redirects are no longer followed (they took the key to the new host), and neither transport keeps more than 64 kB of an answer.
